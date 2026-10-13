@@ -2,12 +2,15 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { Shield, LogOut, Plus, Trash2, Copy, CheckCircle, XCircle, Building2, Key, Calendar, RefreshCw, Search, AlertTriangle, AlertOctagon, Clock, ArrowUpDown, PenLine } from 'lucide-react';
 import { License } from '../types';
 import { getLicenseDaysRemaining, formatLicenseDateLongTr, licenseEndOfDayMs } from '../lib/licenseDates';
+import DatabaseImportSection from './DatabaseImportSection';
 
 interface Props {
-  onLogout: () => void;
+  onLogout?: () => void;
+  embedded?: boolean;
+  onSelectKurum?: (kurumKodu: string) => void;
 }
 
-export default function SuperAdminPanel({ onLogout }: Props) {
+export default function SuperAdminPanel({ onLogout, embedded = false, onSelectKurum }: Props) {
   const [licenses, setLicenses] = useState<License[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -97,6 +100,7 @@ export default function SuperAdminPanel({ onLogout }: Props) {
       if (res.ok) {
         const data = await res.json();
         setLicenses(data);
+        setError('');
       } else {
         setError('Lisanslar yüklenemedi.');
       }
@@ -142,7 +146,17 @@ export default function SuperAdminPanel({ onLogout }: Props) {
         setShowNewForm(false);
       } else {
         const data = await res.json();
-        alert(data.error || 'Lisans oluşturulamadı.');
+        if (res.status === 409 && data.license) {
+          const goExtend = confirm(
+            `${data.error}\n\nMevcut lisansı uzatma ekranını açmak ister misiniz?`,
+          );
+          if (goExtend) {
+            setShowNewForm(false);
+            openEditLicense(data.license);
+          }
+        } else {
+          alert(data.error || 'Lisans oluşturulamadı.');
+        }
       }
     } catch {
       alert('Bağlantı hatası.');
@@ -208,7 +222,7 @@ export default function SuperAdminPanel({ onLogout }: Props) {
   };
 
   const handleDeleteLicense = async (id: string) => {
-    if (!confirm('Bu lisansı silmek istediğinizden emin misiniz?')) return;
+    if (!confirm('Bu lisansı silmek istediğinizden emin misiniz?\n\nOkul, aynı kurum kodu için yeni lisans oluşturulana kadar giriş yapamaz.')) return;
 
     try {
       const token = localStorage.getItem('token');
@@ -389,34 +403,8 @@ export default function SuperAdminPanel({ onLogout }: Props) {
     });
   };
 
-  return (
-    <div className="min-h-screen bg-slate-900 text-white">
-      {/* Header */}
-      <header className="bg-slate-800 border-b border-slate-700 sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <div className="flex items-center gap-3">
-              <div className="bg-purple-600 p-2 rounded-lg">
-                <Shield className="w-6 h-6" />
-              </div>
-              <div>
-                <h1 className="text-lg font-bold">Yönetim Paneli</h1>
-                <p className="text-xs text-slate-400">Lisans Yönetimi</p>
-              </div>
-            </div>
-            <button
-              onClick={onLogout}
-              className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-medium transition-colors"
-            >
-              <LogOut className="w-4 h-4" />
-              Çıkış
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+  const panelContent = (
+    <>
         {/* Stats */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
           <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
@@ -476,6 +464,8 @@ export default function SuperAdminPanel({ onLogout }: Props) {
             </div>
           </button>
         </div>
+
+        <DatabaseImportSection onImported={fetchLicenses} />
 
         {/* Acil durum bandı */}
         {(stats.expired > 0 || stats.soon > 0) && (
@@ -613,20 +603,26 @@ export default function SuperAdminPanel({ onLogout }: Props) {
           ] as const).map(chip => (
             <button
               key={chip.id}
-              onClick={() => setFilterMode(chip.id as any)}
-              className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors border ${
+              onClick={() => setFilterMode(chip.id)}
+              className={`px-3 py-1.5 rounded-md border transition-colors ${
                 filterMode === chip.id
-                  ? (chip as any).color === 'amber'
-                    ? 'bg-amber-500/20 border-amber-500 text-amber-200'
-                    : (chip as any).color === 'red'
-                      ? 'bg-red-500/20 border-red-500 text-red-200'
-                      : 'bg-purple-600 border-purple-500 text-white'
+                  ? 'bg-purple-600 border-purple-500 text-white'
                   : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
               }`}
             >
               {chip.label}
             </button>
           ))}
+          {(filterMode !== 'all' || searchTerm) && (
+            <button
+              onClick={() => { setFilterMode('all'); setSearchTerm(''); }}
+              className="px-3 py-1.5 rounded-md border border-slate-700 bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white transition-colors"
+            >
+              Filtreleri Temizle
+            </button>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2 mb-6 text-sm">
           <div className="mx-2 w-px h-5 bg-slate-700" />
           <span className="text-xs text-slate-400 mr-1 flex items-center gap-1">
             <ArrowUpDown className="w-3.5 h-3.5" /> Sırala:
@@ -657,6 +653,10 @@ export default function SuperAdminPanel({ onLogout }: Props) {
               <Key className="w-5 h-5 text-purple-400" />
               Yeni Lisans Oluştur
             </h3>
+            <p className="text-sm text-slate-400 mb-4">
+              Yalnızca hiç lisans tanımlanmamış yeni okullar için. Daha önce kayıtlı okullarda yeni lisans oluşturmayın;
+              listeden ilgili kaydı bulup <span className="text-violet-300 font-medium">uzatın</span>. Okul aynı şifrelerle giriş yapmaya devam eder.
+            </p>
             <form onSubmit={handleCreateLicense} className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -857,6 +857,16 @@ export default function SuperAdminPanel({ onLogout }: Props) {
                       </td>
                       <td className="px-4 py-3 text-right">
                         <div className="inline-flex items-center justify-end gap-1">
+                          {onSelectKurum && (
+                            <button
+                              type="button"
+                              onClick={() => onSelectKurum(license.kurumKodu)}
+                              className="p-2 text-emerald-300 hover:bg-emerald-900/40 rounded-lg transition-colors"
+                              title="Bu kurumun uygulamasını aç"
+                            >
+                              <Building2 className="w-4 h-4" />
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => openEditLicense(license)}
@@ -882,9 +892,11 @@ export default function SuperAdminPanel({ onLogout }: Props) {
             </div>
           </div>
         )}
-      </main>
+    </>
 
-      {editLicense && (
+  );
+
+  const editModal = editLicense && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
           <div className="bg-slate-800 border border-slate-600 rounded-xl shadow-2xl max-w-md w-full p-6">
             <h3 className="text-lg font-semibold text-white mb-1 flex items-center gap-2">
@@ -893,6 +905,7 @@ export default function SuperAdminPanel({ onLogout }: Props) {
             </h3>
             <p className="text-xs text-slate-400 mb-4">
               Kurum kodu: <code className="text-violet-300">{editLicense.kurumKodu}</code> — lisans anahtarı değişmez.
+              Uzatma sonrası okul daha önce belirlediği kullanıcı adı ve şifre ile giriş yapabilir; yeniden kayıt gerekmez.
             </p>
             <form onSubmit={handleSaveLicenseEdit} className="space-y-4">
               <div>
@@ -934,7 +947,49 @@ export default function SuperAdminPanel({ onLogout }: Props) {
             </form>
           </div>
         </div>
-      )}
+      );
+
+  if (embedded) {
+    return (
+      <div className="rounded-xl overflow-hidden border border-slate-700">
+        <div className="bg-slate-900 text-white px-4 sm:px-6 py-6">
+          {panelContent}
+        </div>
+        {editModal}
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-white">
+      <header className="bg-slate-800 border-b border-slate-700 sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-16">
+            <div className="flex items-center gap-3">
+              <div className="bg-purple-600 p-2 rounded-lg">
+                <Shield className="w-6 h-6" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold">Yönetim Paneli</h1>
+                <p className="text-xs text-slate-400">Lisans Yönetimi</p>
+              </div>
+            </div>
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-medium transition-colors"
+              >
+                <LogOut className="w-4 h-4" />
+                Çıkış
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {panelContent}
+      </main>
+      {editModal}
     </div>
   );
 }

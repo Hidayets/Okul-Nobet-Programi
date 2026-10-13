@@ -68,6 +68,8 @@ export default function UpdateNotifier({ manualCheckTrigger, onStatusChange }: P
         setStatus({ status: 'error', message: res?.error || 'Bilinmeyen hata' });
       }
       // Diğer durumlar onUpdateStatus event'i ile gelir
+    }).catch((err: unknown) => {
+      setStatus({ status: 'error', message: err instanceof Error ? err.message : 'Güncelleme kontrolü başarısız' });
     });
   }, [manualCheckTrigger]);
 

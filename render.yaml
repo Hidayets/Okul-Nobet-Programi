@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: okul-nobet
+    runtime: docker
+    # Kalıcı disk ücretli planlarda vardır; ücretsiz planda yeniden başlatmada veriler silinir.
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /api/health
+    disk:
+      name: okul-nobet-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      # Süper yönetici girişi için kendi belirleyeceğiniz uzun bir anahtar.
+      - key: SUPER_ADMIN_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      # LICENSE_SECRET bilerek tanımlanmadı: mevcut lisans anahtarları varsayılan değerle üretildi.

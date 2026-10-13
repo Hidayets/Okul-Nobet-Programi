@@ -1,8 +1,9 @@
 import React, { useState, useRef } from 'react';
-import { Plus, Trash2, FileSpreadsheet, Pencil, X, Check, CheckSquare, Square, AlertTriangle, CalendarOff, Clipboard, CalendarCheck } from 'lucide-react';
+import { Plus, Trash2, FileSpreadsheet, Pencil, X, Check, CheckSquare, Square, AlertTriangle, CalendarOff, Clipboard, CalendarCheck, Pin } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import * as XLSX from 'xlsx';
 import { Teacher, DutyType } from '../types';
+import { parseTeachersFromWorksheet } from '../lib/teacherExcelImport';
 
 const CONSTRAINT_DAYS = [
   { id: 1, label: 'Pzt' },
@@ -12,16 +13,127 @@ const CONSTRAINT_DAYS = [
   { id: 5, label: 'Cum' },
 ];
 
+const dayLabel = (id: number) => CONSTRAINT_DAYS.find(d => d.id === id)?.label;
+
+interface DutyDayPickerProps {
+  preferredDay: number | null;
+  setPreferredDay: (day: number | null) => void;
+  alternativeDays: number[];
+  setAlternativeDays: React.Dispatch<React.SetStateAction<number[]>>;
+  unavailableDays: number[];
+  setUnavailableDays: React.Dispatch<React.SetStateAction<number[]>>;
+  compact?: boolean;
+}
+
+function DutyDayPicker({
+  preferredDay,
+  setPreferredDay,
+  alternativeDays,
+  setAlternativeDays,
+  unavailableDays,
+  setUnavailableDays,
+  compact,
+}: DutyDayPickerProps) {
+  const hasWhitelist = preferredDay !== null || alternativeDays.length > 0;
+  const labelClass = `text-xs font-medium text-slate-500 flex items-center gap-1 ${compact ? 'min-w-[140px]' : 'min-w-[180px]'}`;
+  const dayBtn = (active: boolean, activeClass: string) =>
+    `${compact ? 'px-2 py-0.5' : 'px-2.5 py-1'} rounded-md text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+      active ? activeClass : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+    }`;
+  const toggle = (setter: React.Dispatch<React.SetStateAction<number[]>>, id: number) =>
+    setter(prev => (prev.includes(id) ? prev.filter(d => d !== id) : [...prev, id]));
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={labelClass}>
+          <Pin className="w-3.5 h-3.5" />
+          Sabit nöbet günü:
+        </span>
+        {CONSTRAINT_DAYS.map(day => (
+          <button
+            type="button"
+            key={day.id}
+            onClick={() => {
+              const next = preferredDay === day.id ? null : day.id;
+              setPreferredDay(next);
+              if (next !== null) setAlternativeDays(prev => prev.filter(d => d !== next));
+            }}
+            disabled={unavailableDays.length > 0}
+            className={dayBtn(preferredDay === day.id, 'bg-indigo-600 text-white')}
+          >
+            {day.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={labelClass}>
+          <CalendarCheck className="w-3.5 h-3.5" />
+          Alternatif gün(ler):
+        </span>
+        {CONSTRAINT_DAYS.map(day => (
+          <button
+            type="button"
+            key={day.id}
+            onClick={() => toggle(setAlternativeDays, day.id)}
+            disabled={unavailableDays.length > 0 || preferredDay === day.id}
+            title={preferredDay === day.id ? 'Sabit nöbet günü' : undefined}
+            className={dayBtn(alternativeDays.includes(day.id), 'bg-emerald-500 text-white')}
+          >
+            {day.label}
+          </button>
+        ))}
+        {hasWhitelist && (
+          <button
+            type="button"
+            onClick={() => { setPreferredDay(null); setAlternativeDays([]); }}
+            className="text-xs text-slate-400 hover:text-slate-600 underline"
+          >
+            temizle
+          </button>
+        )}
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={labelClass}>
+          <CalendarOff className="w-3.5 h-3.5" />
+          {compact ? 'Tutamaz:' : 'Nöbet tutamayacağı günler:'}
+        </span>
+        {CONSTRAINT_DAYS.map(day => (
+          <button
+            type="button"
+            key={day.id}
+            onClick={() => toggle(setUnavailableDays, day.id)}
+            disabled={hasWhitelist}
+            className={dayBtn(unavailableDays.includes(day.id), 'bg-amber-500 text-white')}
+          >
+            {day.label}
+          </button>
+        ))}
+      </div>
+      {!compact && (
+        <p className="text-[11px] text-slate-400">
+          Sabit gün seçilen öğretmen o gün nöbete öncelikli yazılır; alternatif günlerde yalnız gerektiğinde
+          (ör. sabit günü tatile denk geldiğinde) görevlendirilir. Yalnız alternatif gün seçilirse öğretmen sadece o günlerde tutar.
+          Gün seçimi ile "tutamaz" kısıtı birbirini dışlar.
+        </p>
+      )}
+    </div>
+  );
+}
+
 interface Props {
   teachers: Teacher[];
   setTeachers: React.Dispatch<React.SetStateAction<Teacher[]>>;
+  /** Silinen öğretmenlerin nöbet, devamsızlık ve görevlendirme kayıtlarını temizler. */
+  onTeachersRemoved?: (ids: string[]) => void;
 }
 
-export default function TeachersTab({ teachers, setTeachers }: Props) {
+export default function TeachersTab({ teachers, setTeachers, onTeachersRemoved }: Props) {
   const [newTeacherName, setNewTeacherName] = useState('');
   const [newTeacherEmail, setNewTeacherEmail] = useState('');
   const [newTeacherDutyType, setNewTeacherDutyType] = useState<DutyType>('sabit');
   const [newUnavailableDays, setNewUnavailableDays] = useState<number[]>([]);
+  const [newPreferredDay, setNewPreferredDay] = useState<number | null>(null);
   const [newAvailableDays, setNewAvailableDays] = useState<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -30,6 +142,7 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
   const [editEmail, setEditEmail] = useState('');
   const [editDutyType, setEditDutyType] = useState<DutyType>('sabit');
   const [editUnavailableDays, setEditUnavailableDays] = useState<number[]>([]);
+  const [editPreferredDay, setEditPreferredDay] = useState<number | null>(null);
   const [editAvailableDays, setEditAvailableDays] = useState<number[]>([]);
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -39,6 +152,7 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
   const [pasteText, setPasteText] = useState('');
   const [pasteDutyType, setPasteDutyType] = useState<DutyType>('sabit');
   const [pastePreview, setPastePreview] = useState<string[]>([]);
+  const [importMessage, setImportMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const toggleSelect = (id: string) => {
     setSelectedIds(prev => {
@@ -58,13 +172,17 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
   };
 
   const handleDeleteSelected = () => {
-    setTeachers(teachers.filter(t => !selectedIds.has(t.id)));
+    const removed = teachers.filter(t => selectedIds.has(t.id)).map(t => t.id);
+    setTeachers(prev => prev.filter(t => !selectedIds.has(t.id)));
+    onTeachersRemoved?.(removed);
     setSelectedIds(new Set());
     setConfirmDialog({ open: false, type: 'selected' });
   };
 
   const handleDeleteAll = () => {
+    const removed = teachers.map(t => t.id);
     setTeachers([]);
+    onTeachersRemoved?.(removed);
     setSelectedIds(new Set());
     setConfirmDialog({ open: false, type: 'all' });
   };
@@ -79,15 +197,17 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
       email: newTeacherEmail.trim(),
       dutyType: newTeacherDutyType,
       unavailableDays: newUnavailableDays.length > 0 ? newUnavailableDays : undefined,
+      preferredDay: newPreferredDay ?? undefined,
       availableDays: newAvailableDays.length > 0 ? newAvailableDays : undefined,
       schedule: {},
     };
 
-    setTeachers([...teachers, newTeacher]);
+    setTeachers(prev => [...prev, newTeacher]);
     setNewTeacherName('');
     setNewTeacherEmail('');
     setNewTeacherDutyType('sabit');
     setNewUnavailableDays([]);
+    setNewPreferredDay(null);
     setNewAvailableDays([]);
   };
 
@@ -151,7 +271,16 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
   };
 
   const handleDeleteTeacher = (id: string) => {
-    setTeachers(teachers.filter((t) => t.id !== id));
+    const teacher = teachers.find(t => t.id === id);
+    if (!confirm(`"${teacher?.name ?? 'Öğretmen'}" silinsin mi? Öğretmenin nöbet, devamsızlık ve görevlendirme kayıtları da silinir.`)) return;
+    setTeachers(prev => prev.filter((t) => t.id !== id));
+    onTeachersRemoved?.([id]);
+    setSelectedIds(prev => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
   };
 
   const handleEditClick = (teacher: Teacher) => {
@@ -160,17 +289,19 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
     setEditEmail(teacher.email || '');
     setEditDutyType(teacher.dutyType || 'sabit');
     setEditUnavailableDays(teacher.unavailableDays || []);
-    setEditAvailableDays(teacher.availableDays || []);
+    setEditPreferredDay(typeof teacher.preferredDay === 'number' ? teacher.preferredDay : null);
+    setEditAvailableDays((teacher.availableDays || []).filter(d => d !== teacher.preferredDay));
   };
 
   const handleSaveEdit = (id: string) => {
     if (!editName.trim()) return;
-    setTeachers(teachers.map(t => t.id === id ? {
+    setTeachers(prev => prev.map(t => t.id === id ? {
       ...t,
       name: editName.trim(),
       email: editEmail.trim(),
       dutyType: editDutyType,
       unavailableDays: editUnavailableDays.length > 0 ? editUnavailableDays : undefined,
+      preferredDay: editPreferredDay ?? undefined,
       availableDays: editAvailableDays.length > 0 ? editAvailableDays : undefined,
     } : t));
     setEditingTeacherId(null);
@@ -186,53 +317,56 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
 
     const reader = new FileReader();
     reader.onload = (evt) => {
-      const bstr = evt.target?.result;
-      const wb = XLSX.read(bstr, { type: 'binary' });
-      const wsname = wb.SheetNames[0];
-      const ws = wb.Sheets[wsname];
-      const data = XLSX.utils.sheet_to_json(ws) as any[];
+      try {
+        const bstr = evt.target?.result;
+        const wb = XLSX.read(bstr, { type: 'binary' });
+        const wsname = wb.SheetNames[0];
+        const ws = wb.Sheets[wsname];
+        const parsed = parseTeachersFromWorksheet(ws);
 
-      const importedTeachers: Teacher[] = data.map((row) => {
-        // Parse schedule from columns like Pzt-1, Sal-3, etc.
-        const schedule: Record<number, Record<number, string>> = {};
-        const dayMap: Record<string, number> = {
-          'Pzt': 1, 'Sal': 2, 'Çar': 3, 'Per': 4, 'Cum': 5
-        };
-
-        Object.keys(row).forEach(key => {
-          const match = key.match(/^(Pzt|Sal|Çar|Per|Cum)-(\d+)$/);
-          if (match) {
-            const dayStr = match[1];
-            const hour = parseInt(match[2], 10);
-            const day = dayMap[dayStr];
-            
-            if (!schedule[day]) schedule[day] = {};
-            schedule[day][hour] = row[key];
-          }
-        });
-
-        let dutyType: DutyType = 'sabit';
-        const rawDutyType = row['Nöbet Tipi'] || row['Duty Type'];
-        if (rawDutyType && typeof rawDutyType === 'string') {
-          const lower = rawDutyType.toLowerCase();
-          if (lower.includes('dışı') || lower.includes('disi') || lower.includes('exempt')) {
-            dutyType = 'nobetDisi';
-          } else if (lower.includes('hareketli')) {
-            dutyType = 'hareketli';
-          }
+        if (parsed.length === 0) {
+          setImportMessage({
+            type: 'error',
+            text: 'Excel dosyasında öğretmen adı bulunamadı. Sadece ad-soyad listesi de yeterlidir.',
+          });
+          return;
         }
 
-        return {
-          id: uuidv4(),
-          name: row['Ad Soyad'] || row['Name'] || 'İsimsiz',
-          email: row['E-posta'] || row['Email'] || '',
-          dutyType,
-          schedule,
-        };
-      });
+        const existing = new Set(teachers.map((t) => t.name.toLocaleLowerCase('tr').trim()));
+        const importedTeachers: Teacher[] = parsed
+          .filter((row) => !existing.has(row.name.toLocaleLowerCase('tr').trim()))
+          .map((row) => ({
+            id: uuidv4(),
+            name: row.name,
+            email: row.email || '',
+            dutyType: row.dutyType || 'sabit',
+            schedule: row.schedule || {},
+          }));
 
-      setTeachers((prev) => [...prev, ...importedTeachers]);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+        if (importedTeachers.length === 0) {
+          setImportMessage({
+            type: 'success',
+            text: `${parsed.length} kayıt bulundu; hepsi zaten listede.`,
+          });
+        } else {
+          const skipped = parsed.length - importedTeachers.length;
+          setTeachers((prev) => [...prev, ...importedTeachers]);
+          setImportMessage({
+            type: 'success',
+            text: skipped > 0
+              ? `${importedTeachers.length} öğretmen eklendi (${skipped} zaten listede).`
+              : `${importedTeachers.length} öğretmen eklendi.`,
+          });
+        }
+      } catch (err) {
+        console.error('Excel aktarım hatası:', err);
+        setImportMessage({
+          type: 'error',
+          text: 'Excel dosyası okunamadı. Dosya biçimini kontrol edin.',
+        });
+      } finally {
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
     };
     reader.readAsBinaryString(file);
   };
@@ -295,6 +429,10 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
                 <option value="hareketli">Hareketli Nöbetçi</option>
                 <option value="nobetDisi">Nöbet Dışı</option>
               </select>
+              <p className="text-xs text-slate-500 mt-1 col-span-full">
+                <strong>Sabit:</strong> Her hafta aynı günde aynı nöbet yerinde.{' '}
+                <strong>Hareketli:</strong> Aynı günde kalır, nöbet yeri her hafta değişir (Pzt Bahçe → sonraki hafta Pzt Koridor).
+              </p>
               <button
                 type="submit"
                 disabled={!newTeacherName.trim()}
@@ -305,70 +443,25 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
             </div>
           </div>
           {newTeacherDutyType !== 'nobetDisi' && (
-            <div className="mt-3 space-y-2">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-medium text-slate-500 flex items-center gap-1 min-w-[180px]">
-                  <CalendarOff className="w-3.5 h-3.5" />
-                  Nöbet tutamayacağı günler:
-                </span>
-                {CONSTRAINT_DAYS.map(day => (
-                  <button
-                    type="button"
-                    key={day.id}
-                    onClick={() => setNewUnavailableDays(prev =>
-                      prev.includes(day.id) ? prev.filter(d => d !== day.id) : [...prev, day.id]
-                    )}
-                    disabled={newAvailableDays.length > 0}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                      newUnavailableDays.includes(day.id)
-                        ? 'bg-amber-500 text-white'
-                        : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-                    }`}
-                  >
-                    {day.label}
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-medium text-slate-500 flex items-center gap-1 min-w-[180px]">
-                  <CalendarCheck className="w-3.5 h-3.5" />
-                  Sadece şu günlerde tutabilir:
-                </span>
-                {CONSTRAINT_DAYS.map(day => (
-                  <button
-                    type="button"
-                    key={day.id}
-                    onClick={() => setNewAvailableDays(prev =>
-                      prev.includes(day.id) ? prev.filter(d => d !== day.id) : [...prev, day.id]
-                    )}
-                    disabled={newUnavailableDays.length > 0}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                      newAvailableDays.includes(day.id)
-                        ? 'bg-emerald-500 text-white'
-                        : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-                    }`}
-                  >
-                    {day.label}
-                  </button>
-                ))}
-                {newAvailableDays.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setNewAvailableDays([])}
-                    className="text-xs text-slate-400 hover:text-slate-600 underline"
-                  >
-                    temizle
-                  </button>
-                )}
-              </div>
-              <p className="text-[11px] text-slate-400">
-                İki kısıt birbirini dışlar; birini kullanırken diğeri otomatik kapanır.
-              </p>
+            <div className="mt-3">
+              <DutyDayPicker
+                preferredDay={newPreferredDay}
+                setPreferredDay={setNewPreferredDay}
+                alternativeDays={newAvailableDays}
+                setAlternativeDays={setNewAvailableDays}
+                unavailableDays={newUnavailableDays}
+                setUnavailableDays={setNewUnavailableDays}
+              />
             </div>
           )}
         </form>
+        {importMessage && (
+          <p className={`text-xs mt-3 ${importMessage.type === 'error' ? 'text-red-600' : 'text-emerald-600'}`}>
+            {importMessage.text}
+          </p>
+        )}
         <p className="text-xs text-slate-500 mt-3">
-          * Excel aktarımı için sütun başlıkları: "Ad Soyad", "E-posta", "Nöbet Tipi", "Pzt-1", vb. olmalıdır.
+          * Excel aktarımı sütun başlıklarını otomatik algılar. Sadece ad-soyad listesi yeterlidir; e-posta, nöbet tipi ve ders programı varsa onlar da çekilir.
         </p>
       </div>
 
@@ -473,60 +566,15 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
                       </div>
                     </div>
                     {editDutyType !== 'nobetDisi' && (
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-medium text-slate-500 flex items-center gap-1 min-w-[120px]">
-                            <CalendarOff className="w-3.5 h-3.5" />
-                            Tutamaz:
-                          </span>
-                          {CONSTRAINT_DAYS.map(day => (
-                            <button
-                              key={day.id}
-                              onClick={() => setEditUnavailableDays(prev =>
-                                prev.includes(day.id) ? prev.filter(d => d !== day.id) : [...prev, day.id]
-                              )}
-                              disabled={editAvailableDays.length > 0}
-                              className={`px-2 py-0.5 rounded-md text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                                editUnavailableDays.includes(day.id)
-                                  ? 'bg-amber-500 text-white'
-                                  : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-                              }`}
-                            >
-                              {day.label}
-                            </button>
-                          ))}
-                        </div>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-medium text-slate-500 flex items-center gap-1 min-w-[120px]">
-                            <CalendarCheck className="w-3.5 h-3.5" />
-                            Sadece:
-                          </span>
-                          {CONSTRAINT_DAYS.map(day => (
-                            <button
-                              key={day.id}
-                              onClick={() => setEditAvailableDays(prev =>
-                                prev.includes(day.id) ? prev.filter(d => d !== day.id) : [...prev, day.id]
-                              )}
-                              disabled={editUnavailableDays.length > 0}
-                              className={`px-2 py-0.5 rounded-md text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                                editAvailableDays.includes(day.id)
-                                  ? 'bg-emerald-500 text-white'
-                                  : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-                              }`}
-                            >
-                              {day.label}
-                            </button>
-                          ))}
-                          {editAvailableDays.length > 0 && (
-                            <button
-                              onClick={() => setEditAvailableDays([])}
-                              className="text-xs text-slate-400 hover:text-slate-600 underline"
-                            >
-                              temizle
-                            </button>
-                          )}
-                        </div>
-                      </div>
+                      <DutyDayPicker
+                        compact
+                        preferredDay={editPreferredDay}
+                        setPreferredDay={setEditPreferredDay}
+                        alternativeDays={editAvailableDays}
+                        setAlternativeDays={setEditAvailableDays}
+                        unavailableDays={editUnavailableDays}
+                        setUnavailableDays={setEditUnavailableDays}
+                      />
                     )}
                   </div>
                 ) : (
@@ -555,13 +603,23 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
                           {teacher.unavailableDays && teacher.unavailableDays.length > 0 && (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-amber-50 text-amber-600 border border-amber-200" title="Bu günlerde nöbet tutamaz">
                               <CalendarOff className="w-3 h-3" />
-                              {teacher.unavailableDays.map(d => CONSTRAINT_DAYS.find(cd => cd.id === d)?.label).filter(Boolean).join(', ')}
+                              {teacher.unavailableDays.map(dayLabel).filter(Boolean).join(', ')}
+                            </span>
+                          )}
+                          {typeof teacher.preferredDay === 'number' && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-indigo-50 text-indigo-700 border border-indigo-200" title="Sabit nöbet günü">
+                              <Pin className="w-3 h-3" />
+                              {dayLabel(teacher.preferredDay)}
                             </span>
                           )}
                           {teacher.availableDays && teacher.availableDays.length > 0 && (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200" title="Sadece bu günlerde nöbet tutabilir">
+                            <span
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200"
+                              title={typeof teacher.preferredDay === 'number' ? 'Alternatif nöbet günleri' : 'Sadece bu günlerde nöbet tutabilir'}
+                            >
                               <CalendarCheck className="w-3 h-3" />
-                              {teacher.availableDays.map(d => CONSTRAINT_DAYS.find(cd => cd.id === d)?.label).filter(Boolean).join(', ')}
+                              {typeof teacher.preferredDay === 'number' ? 'Alt: ' : ''}
+                              {teacher.availableDays.map(dayLabel).filter(Boolean).join(', ')}
                             </span>
                           )}
                         </div>
@@ -607,8 +665,8 @@ export default function TeachersTab({ teachers, setTeachers }: Props) {
             </div>
             <p className="text-slate-600 mb-6">
               {confirmDialog.type === 'all'
-                ? `Tüm ${teachers.length} öğretmen kalıcı olarak silinecektir. Bu işlem geri alınamaz.`
-                : `Seçili ${selectedIds.size} öğretmen kalıcı olarak silinecektir. Bu işlem geri alınamaz.`}
+                ? `Tüm ${teachers.length} öğretmen ve bu öğretmenlerin nöbet, devamsızlık ve görevlendirme kayıtları kalıcı olarak silinecektir. Bu işlem geri alınamaz.`
+                : `Seçili ${selectedIds.size} öğretmen ve bu öğretmenlerin nöbet, devamsızlık ve görevlendirme kayıtları kalıcı olarak silinecektir. Bu işlem geri alınamaz.`}
             </p>
             <div className="flex justify-end gap-3">
               <button

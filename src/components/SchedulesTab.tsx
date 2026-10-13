@@ -4,6 +4,8 @@ import * as XLSX from 'xlsx';
 import { v4 as uuidv4 } from 'uuid';
 import { Teacher, ClassInfo, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes } from '../types';
 import { unifyTeachers, findTeacherFuzzy } from '../lib/teacherMatching';
+import { applyAdminDetection, formatDetectionSummary } from '../lib/adminDetection';
+import { validateSchedules, ValidationReport } from '../lib/scheduleValidation';
 
 const DAY_NUM_TO_SHORT: Record<number, string> = {
   1: 'Pzt', 2: 'Sal', 3: 'Çar', 4: 'Per', 5: 'Cum', 6: 'Cmt', 0: 'Paz'
@@ -30,6 +32,7 @@ interface Props {
   classes: ClassInfo[];
   setClasses: React.Dispatch<React.SetStateAction<ClassInfo[]>>;
   schoolInfo: SchoolInfo;
+  setSchoolInfo: React.Dispatch<React.SetStateAction<SchoolInfo>>;
 }
 
 /* ─── Excel Helpers ─── */
@@ -277,98 +280,6 @@ function parseExcelSchedule(
   return results;
 }
 
-/* ─── Schedule Validation ─── */
-
-function normalizeForMatch(s: string): string {
-  return turkishLower(s).replace(/[\s\-_./]+/g, '');
-}
-
-function teacherNameMatches(teacherName: string, value: string): boolean {
-  const tLower = turkishLower(teacherName.trim());
-  const vLower = turkishLower(value.trim());
-
-  if (tLower === vLower) return true;
-  if (vLower.includes(tLower) || tLower.includes(vLower)) return true;
-
-  const tParts = tLower.split(/\s+/).filter(p => p.length >= 2);
-  const vParts = vLower.split(/\s+/).filter(p => p.length >= 2);
-  for (const tp of tParts) {
-    for (const vp of vParts) {
-      if (tp === vp) return true;
-    }
-  }
-
-  return fuzzyTeacherMatch(teacherName, value);
-}
-
-/**
- * Handles abbreviation formats like "A.YILMAZ", "H.ÖZTÜRK", "Ah.Yılmaz"
- * matching against full names like "Ahmet YILMAZ", "Hasan ÖZTÜRK".
- * Also handles reversed order (surname first) and initial-only formats.
- */
-function fuzzyTeacherMatch(fullName: string, abbreviated: string): boolean {
-  const full = turkishLower(fullName.trim());
-  const abbr = turkishLower(abbreviated.trim());
-
-  const fullParts = full.split(/\s+/).filter(Boolean);
-  const abbrClean = abbr.replace(/\./g, '. ').replace(/\s+/g, ' ').trim();
-  const abbrParts = abbrClean.split(/\s+/).filter(Boolean).map(p => p.replace(/\.$/, ''));
-
-  if (fullParts.length < 2 || abbrParts.length < 1) return false;
-
-  const tryMatch = (nameParts: string[], candidateParts: string[]): boolean => {
-    if (candidateParts.length < 1) return false;
-
-    let matchedParts = 0;
-    let hasFullSurnameMatch = false;
-    const usedIndices = new Set<number>();
-
-    for (const cp of candidateParts) {
-      let bestMatchIdx = -1;
-      let bestMatchType: 'full' | 'initial' | 'prefix' = 'full';
-
-      for (let ni = 0; ni < nameParts.length; ni++) {
-        if (usedIndices.has(ni)) continue;
-        const np = nameParts[ni];
-
-        if (cp === np) {
-          bestMatchIdx = ni;
-          bestMatchType = 'full';
-          break;
-        }
-        if (cp.length === 1 && np.startsWith(cp)) {
-          if (bestMatchIdx === -1) {
-            bestMatchIdx = ni;
-            bestMatchType = 'initial';
-          }
-        } else if (cp.length >= 2 && cp.length < np.length && np.startsWith(cp)) {
-          if (bestMatchIdx === -1 || bestMatchType === 'initial') {
-            bestMatchIdx = ni;
-            bestMatchType = 'prefix';
-          }
-        }
-      }
-
-      if (bestMatchIdx >= 0) {
-        usedIndices.add(bestMatchIdx);
-        matchedParts++;
-        if (bestMatchType === 'full' && nameParts[bestMatchIdx].length >= 2) {
-          hasFullSurnameMatch = true;
-        }
-      }
-    }
-
-    return matchedParts === candidateParts.length && hasFullSurnameMatch;
-  };
-
-  if (tryMatch(fullParts, abbrParts)) return true;
-
-  const reversedParts = [...fullParts].reverse();
-  if (tryMatch(reversedParts, abbrParts)) return true;
-
-  return false;
-}
-
 /**
  * Excel'den okunan adı mevcut listede arar.
  * Önce birebir, bulunmazsa kısaltma (fuzzy) eşleşmesi yapılır.
@@ -496,6 +407,7 @@ function mergeTeacherRecordsKeepFirstId(a: Teacher, b: Teacher): Teacher {
           ? 'hareketli'
           : a.dutyType || b.dutyType || 'sabit',
     unavailableDays,
+    preferredDay: a.preferredDay ?? b.preferredDay,
     availableDays,
   };
 }
@@ -506,178 +418,6 @@ function mergeTeacherRecordsKeepFirstId(a: Teacher, b: Teacher): Teacher {
  */
 function dedupeTeachersList(list: Teacher[]): { teachers: Teacher[]; idRemap: Record<string, string> } {
   return unifyTeachers(list);
-}
-
-interface ComparisonEntry {
-  day: number;
-  hour: number;
-  teacherName: string;
-  teacherValue: string;
-  className: string | null;
-  classValue: string | null;
-  status: 'match' | 'mismatch' | 'class_not_found' | 'class_slot_empty';
-}
-
-interface ConflictEntry {
-  day: number;
-  hour: number;
-  className: string;
-  teacherNames: string[];
-}
-
-interface ReverseIssue {
-  day: number;
-  hour: number;
-  className: string;
-  classValue: string;
-  status: 'teacher_not_found' | 'teacher_slot_empty' | 'teacher_mismatch';
-  teacherName?: string;
-  teacherValue?: string;
-}
-
-interface ValidationReport {
-  comparisons: ComparisonEntry[];
-  conflicts: ConflictEntry[];
-  reverseIssues: ReverseIssue[];
-}
-
-function validateSchedules(teachers: Teacher[], classes: ClassInfo[]): ValidationReport {
-  const comparisons: ComparisonEntry[] = [];
-  const reverseIssues: ReverseIssue[] = [];
-
-  const twSchedule = teachers.filter(t => t.schedule && Object.keys(t.schedule).length > 0);
-  const cwSchedule = classes.filter(c => c.schedule && Object.keys(c.schedule).length > 0);
-
-  // Build class name lookup: normalized name → ClassInfo
-  const classMap = new Map<string, ClassInfo>();
-  for (const cls of cwSchedule) {
-    classMap.set(normalizeForMatch(cls.name), cls);
-  }
-
-  // Build teacher name lookup: normalized name → Teacher
-  const teacherMap = new Map<string, Teacher>();
-  for (const t of twSchedule) {
-    teacherMap.set(normalizeForMatch(t.name), t);
-  }
-
-  // Forward check: teacher schedule → class schedule
-  // Also track (day-hour-className) for conflict detection
-  const classSlotTeachers = new Map<string, string[]>();
-
-  for (const teacher of twSchedule) {
-    if (!teacher.schedule) continue;
-    for (const [dayStr, hours] of Object.entries(teacher.schedule)) {
-      const day = parseInt(dayStr);
-      for (const [hourStr, value] of Object.entries(hours)) {
-        const hour = parseInt(hourStr);
-        const normalized = normalizeForMatch(value);
-
-        // Track for conflict detection
-        const conflictKey = `${day}-${hour}-${normalized}`;
-        if (!classSlotTeachers.has(conflictKey)) classSlotTeachers.set(conflictKey, []);
-        classSlotTeachers.get(conflictKey)!.push(teacher.name);
-
-        // Try to find matching class
-        const matchedClass = classMap.get(normalized);
-
-        if (!matchedClass) {
-          comparisons.push({
-            day, hour, teacherName: teacher.name, teacherValue: value,
-            className: null, classValue: null, status: 'class_not_found',
-          });
-          continue;
-        }
-
-        const classValueAtSlot = matchedClass.schedule?.[day]?.[hour];
-
-        if (!classValueAtSlot) {
-          comparisons.push({
-            day, hour, teacherName: teacher.name, teacherValue: value,
-            className: matchedClass.name, classValue: null, status: 'class_slot_empty',
-          });
-          continue;
-        }
-
-        const isMatch = teacherNameMatches(teacher.name, classValueAtSlot);
-        comparisons.push({
-          day, hour, teacherName: teacher.name, teacherValue: value,
-          className: matchedClass.name, classValue: classValueAtSlot,
-          status: isMatch ? 'match' : 'mismatch',
-        });
-      }
-    }
-  }
-
-  // Conflict detection: multiple teachers claiming same class at same time
-  const conflicts: ConflictEntry[] = [];
-  for (const [key, names] of classSlotTeachers) {
-    if (names.length > 1) {
-      const [dayStr, hourStr, ...classNameParts] = key.split('-');
-      conflicts.push({
-        day: parseInt(dayStr),
-        hour: parseInt(hourStr),
-        className: classNameParts.join('-'),
-        teacherNames: names,
-      });
-    }
-  }
-
-  // Reverse check: class schedule → teacher schedule
-  for (const cls of cwSchedule) {
-    if (!cls.schedule) continue;
-    for (const [dayStr, hours] of Object.entries(cls.schedule)) {
-      const day = parseInt(dayStr);
-      for (const [hourStr, value] of Object.entries(hours)) {
-        const hour = parseInt(hourStr);
-
-        let matchedTeacher: Teacher | undefined;
-        for (const [, t] of teacherMap) {
-          if (teacherNameMatches(t.name, value)) {
-            matchedTeacher = t;
-            break;
-          }
-        }
-
-        if (!matchedTeacher) {
-          // Value might be a subject name, not a teacher name — only flag if it looks like a name
-          const looksLikeName = value.split(/\s+/).length >= 2
-            || value.match(/[A-ZÇŞÜÖĞİ]{2,}/);
-          if (looksLikeName) {
-            reverseIssues.push({
-              day, hour, className: cls.name, classValue: value,
-              status: 'teacher_not_found',
-            });
-          }
-          continue;
-        }
-
-        const teacherValueAtSlot = matchedTeacher.schedule?.[day]?.[hour];
-
-        if (!teacherValueAtSlot) {
-          reverseIssues.push({
-            day, hour, className: cls.name, classValue: value,
-            status: 'teacher_slot_empty',
-            teacherName: matchedTeacher.name,
-          });
-          continue;
-        }
-
-        // Check if teacher's value references this class
-        const classNorm = normalizeForMatch(cls.name);
-        const teacherValNorm = normalizeForMatch(teacherValueAtSlot);
-        if (classNorm !== teacherValNorm) {
-          reverseIssues.push({
-            day, hour, className: cls.name, classValue: value,
-            status: 'teacher_mismatch',
-            teacherName: matchedTeacher.name,
-            teacherValue: teacherValueAtSlot,
-          });
-        }
-      }
-    }
-  }
-
-  return { comparisons, conflicts, reverseIssues };
 }
 
 /* ─── Schedule Table Component ─── */
@@ -914,6 +654,7 @@ export default function SchedulesTab({
   classes,
   setClasses,
   schoolInfo,
+  setSchoolInfo,
 }: Props) {
   const settings = schoolInfo.settings ?? DEFAULT_SCHOOL_SETTINGS;
   const lessonTimes = useMemo(() => calculateLessonTimes(settings), [settings]);
@@ -1019,6 +760,10 @@ export default function SchedulesTab({
         if (Object.keys(idRemap).length > 0) {
           onTeacherIdsMerged?.(idRemap);
         }
+
+        const { schoolInfo: detectedInfo, detection, changed } = applyAdminDetection(schoolInfo, dedupedTeachers);
+        if (changed) setSchoolInfo(detectedInfo);
+
         setTeacherStatus('success');
         const detectedDays = new Set<number>();
         mergedParsed.forEach(({ schedule }) => {
@@ -1041,6 +786,8 @@ export default function SchedulesTab({
         if (createdCount > 0) parts.push(`${createdCount} yeni öğretmen eklendi`);
         if (matchedNames.length > 0) parts.push(`Eşleştirilen: ${matchedNames.slice(0, 3).join(', ')}${matchedNames.length > 3 ? ` (+${matchedNames.length - 3})` : ''}`);
         if (dayNames) parts.push(`Günler: ${dayNames}`);
+        const adminSummary = formatDetectionSummary(detection);
+        if (adminSummary) parts.push(`İdare: ${adminSummary}`);
         setSuccessDetail(parts.join(' · '));
         setTimeout(() => setTeacherStatus('idle'), 6000);
       } catch {
@@ -1075,6 +822,8 @@ export default function SchedulesTab({
         const updatedClasses = [...classes];
         let updatedCount = 0;
         let createdCount = 0;
+        // Aynı sınıf Excel'de birden çok satırda olabilir; bu içe aktarmada görülen sınıfların programı birleştirilir.
+        const importedIds = new Set<string>();
 
         parsed.forEach(({ name, schedule }) => {
           const existingIndex = updatedClasses.findIndex(
@@ -1082,14 +831,23 @@ export default function SchedulesTab({
           );
 
           if (existingIndex >= 0) {
-            updatedClasses[existingIndex] = {
-              ...updatedClasses[existingIndex],
-              schedule,
-            };
+            const existing = updatedClasses[existingIndex];
+            if (importedIds.has(existing.id)) {
+              const merged: typeof schedule = { ...existing.schedule };
+              for (const [day, hours] of Object.entries(schedule)) {
+                merged[Number(day)] = { ...(merged[Number(day)] || {}), ...hours };
+              }
+              updatedClasses[existingIndex] = { ...existing, schedule: merged };
+              return;
+            }
+            importedIds.add(existing.id);
+            updatedClasses[existingIndex] = { ...existing, schedule };
             updatedCount++;
           } else {
+            const id = uuidv4();
+            importedIds.add(id);
             updatedClasses.push({
-              id: uuidv4(),
+              id,
               name,
               schedule,
             });
@@ -1248,7 +1006,7 @@ export default function SchedulesTab({
     setNewClassName('');
   };
 
-  const dayLabels = settings.schoolDays
+  const dayLabels = [...settings.schoolDays]
     .sort((a, b) => (a === 0 ? 7 : a) - (b === 0 ? 7 : b))
     .map(d => DAY_NUM_TO_SHORT[d] + '-1')
     .join('", "');
@@ -1354,7 +1112,9 @@ export default function SchedulesTab({
                 <div>
                   <h2 className="text-lg font-semibold text-slate-800">Program Karşılaştırma</h2>
                   <p className="text-sm text-slate-500">
-                    Öğretmen ve sınıf programlarının birbiriyle uyumunu kontrol edin
+                    Sınıfın dersi olan her saatte o sınıfa dersi olan bir öğretmen var mı kontrol edin.
+                    Sınıf programında satır başındaki sınıf esas alınır; hücrede "H. SEVDİ", "HSVD" gibi
+                    bir öğretmen kısaltması varsa o öğretmenin programı da kontrol edilir.
                   </p>
                 </div>
               </div>
@@ -1373,13 +1133,14 @@ export default function SchedulesTab({
 
             {showValidation && validationReport && (() => {
               const matches = validationReport.comparisons.filter(c => c.status === 'match').length;
-              const mismatches = validationReport.comparisons.filter(c => c.status === 'mismatch').length;
               const classEmpty = validationReport.comparisons.filter(c => c.status === 'class_slot_empty').length;
+              const uncovered = validationReport.uncoveredClassSlots.length;
+              const teacherIssues = validationReport.classTeacherIssues.length;
+              const mismatches = classEmpty + uncovered + teacherIssues;
               const classNotFound = validationReport.comparisons.filter(c => c.status === 'class_not_found').length;
               const conflicts = validationReport.conflicts.length;
-              const reverseProblems = validationReport.reverseIssues.length;
-              const totalChecked = validationReport.comparisons.length;
-              const totalProblems = mismatches + classEmpty + conflicts + reverseProblems;
+              const totalChecked = validationReport.comparisons.length + uncovered;
+              const totalProblems = mismatches + conflicts;
               const isFullyValid = totalProblems === 0 && matches > 0;
 
               return (
@@ -1394,9 +1155,9 @@ export default function SchedulesTab({
                       <div className={`text-2xl font-bold ${mismatches > 0 ? 'text-red-700' : 'text-slate-400'}`}>{mismatches}</div>
                       <div className={`text-xs font-medium ${mismatches > 0 ? 'text-red-600' : 'text-slate-400'}`}>Uyumsuzluk</div>
                     </div>
-                    <div className={`border rounded-xl p-3 text-center ${classEmpty + classNotFound > 0 ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
-                      <div className={`text-2xl font-bold ${classEmpty + classNotFound > 0 ? 'text-amber-700' : 'text-slate-400'}`}>{classEmpty + classNotFound}</div>
-                      <div className={`text-xs font-medium ${classEmpty + classNotFound > 0 ? 'text-amber-600' : 'text-slate-400'}`}>Eksik Veri</div>
+                    <div className={`border rounded-xl p-3 text-center ${classNotFound > 0 ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'}`}>
+                      <div className={`text-2xl font-bold ${classNotFound > 0 ? 'text-amber-700' : 'text-slate-400'}`}>{classNotFound}</div>
+                      <div className={`text-xs font-medium ${classNotFound > 0 ? 'text-amber-600' : 'text-slate-400'}`}>Eksik Veri</div>
                     </div>
                     <div className={`border rounded-xl p-3 text-center ${conflicts > 0 ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
                       <div className={`text-2xl font-bold ${conflicts > 0 ? 'text-red-700' : 'text-slate-400'}`}>{conflicts}</div>
@@ -1412,6 +1173,7 @@ export default function SchedulesTab({
                         <p className="font-semibold text-emerald-800">Programlar Birebir Uyumlu</p>
                         <p className="text-sm text-emerald-600">
                           {totalChecked} kontrol yapıldı, {matches} eşleşme onaylandı. Tüm veriler tutarlı.
+                          {validationReport.recognizedClassSlots > 0 && ` Sınıf programında ${validationReport.recognizedClassSlots} saatte öğretmen adı tanındı ve doğrulandı.`}
                         </p>
                       </div>
                     </div>
@@ -1424,6 +1186,7 @@ export default function SchedulesTab({
                         </p>
                         <p className="text-sm text-amber-600">
                           {totalChecked} kontrol yapıldı. Aşağıdaki detayları inceleyerek düzeltme yapabilirsiniz.
+                          {validationReport.recognizedClassSlots > 0 && ` Sınıf programında ${validationReport.recognizedClassSlots} saatte öğretmen adı tanındı.`}
                         </p>
                       </div>
                     </div>
@@ -1453,23 +1216,47 @@ export default function SchedulesTab({
                   )}
 
                   {/* Mismatches */}
-                  {validationReport.comparisons.filter(c => c.status === 'mismatch').length > 0 && (
+                  {mismatches > 0 && (
                     <div className="space-y-1">
                       <h4 className="text-sm font-semibold text-red-700 flex items-center gap-1.5">
                         <AlertCircle className="w-4 h-4" />
-                        Uyumsuzluklar (öğretmen ve sınıf programı tutarsız)
+                        Uyumsuzluklar (sınıfın dersi var ama öğretmeni yok ya da tersi)
                       </h4>
                       <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                        {validationReport.classTeacherIssues.map((s, i) => (
+                          <div key={`t-${i}`} className="flex items-start gap-2 p-2.5 bg-red-50 border border-red-100 rounded-lg text-sm">
+                            <XIcon className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                            <span className="text-red-800">
+                              <span className="font-medium">{DAY_NUM_TO_SHORT[s.day]} {s.hour}. ders</span>
+                              {' — '}
+                              <span className="font-semibold">{s.className}</span> programında "{s.classValue}"
+                              (<span className="font-semibold">{s.teacherName}</span>) yazıyor, ancak öğretmenin programında
+                              {s.teacherValue ? <> bu saatte "{s.teacherValue}" var</> : ' bu saat boş'}
+                              {s.coveredBy.length > 0 && <>; bu saatte {s.className} dersi: {s.coveredBy.join(', ')}</>}
+                            </span>
+                          </div>
+                        ))}
+                        {validationReport.uncoveredClassSlots.map((s, i) => (
+                          <div key={`u-${i}`} className="flex items-start gap-2 p-2.5 bg-red-50 border border-red-100 rounded-lg text-sm">
+                            <XIcon className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                            <span className="text-red-800">
+                              <span className="font-medium">{DAY_NUM_TO_SHORT[s.day]} {s.hour}. ders</span>
+                              {' — '}
+                              <span className="font-semibold">{s.className}</span> sınıfının bu saatte dersi var ("{s.classValue}"),
+                              ancak hiçbir öğretmenin programında bu saatte {s.className} dersi yok
+                            </span>
+                          </div>
+                        ))}
                         {validationReport.comparisons
-                          .filter(c => c.status === 'mismatch')
+                          .filter(c => c.status === 'class_slot_empty')
                           .map((c, i) => (
-                            <div key={i} className="flex items-start gap-2 p-2.5 bg-red-50 border border-red-100 rounded-lg text-sm">
+                            <div key={`e-${i}`} className="flex items-start gap-2 p-2.5 bg-red-50 border border-red-100 rounded-lg text-sm">
                               <XIcon className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
                               <span className="text-red-800">
                                 <span className="font-medium">{DAY_NUM_TO_SHORT[c.day]} {c.hour}. ders</span>
                                 {' — '}
-                                <span className="font-semibold">{c.teacherName}</span> programında "{c.teacherValue}",
-                                ancak <span className="font-semibold">{c.className}</span> programında "{c.classValue}"
+                                <span className="font-semibold">{c.teacherName}</span> programında {c.className} dersi var,
+                                ancak <span className="font-semibold">{c.className}</span> sınıf programında bu saat boş
                               </span>
                             </div>
                           ))}
@@ -1478,26 +1265,13 @@ export default function SchedulesTab({
                   )}
 
                   {/* Missing Data */}
-                  {(classEmpty + classNotFound > 0 || reverseProblems > 0) && (
+                  {classNotFound > 0 && (
                     <div className="space-y-1">
                       <h4 className="text-sm font-semibold text-amber-700 flex items-center gap-1.5">
                         <AlertTriangle className="w-4 h-4" />
                         Eksik Veriler
                       </h4>
                       <div className="space-y-1.5 max-h-64 overflow-y-auto">
-                        {validationReport.comparisons
-                          .filter(c => c.status === 'class_slot_empty')
-                          .map((c, i) => (
-                            <div key={`e-${i}`} className="flex items-start gap-2 p-2.5 bg-amber-50 border border-amber-100 rounded-lg text-sm">
-                              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-                              <span className="text-amber-800">
-                                <span className="font-medium">{DAY_NUM_TO_SHORT[c.day]} {c.hour}. ders</span>
-                                {' — '}
-                                <span className="font-semibold">{c.teacherName}</span> → {c.teacherValue},
-                                ancak <span className="font-semibold">{c.className}</span> programında bu saat boş
-                              </span>
-                            </div>
-                          ))}
                         {validationReport.comparisons
                           .filter(c => c.status === 'class_not_found')
                           .slice(0, 20)
@@ -1509,32 +1283,6 @@ export default function SchedulesTab({
                                 {' — '}
                                 <span className="font-semibold">{c.teacherName}</span> → "{c.teacherValue}"
                                 (sınıf programı yüklenmemiş)
-                              </span>
-                            </div>
-                          ))}
-                        {validationReport.reverseIssues
-                          .filter(r => r.status === 'teacher_slot_empty')
-                          .map((r, i) => (
-                            <div key={`re-${i}`} className="flex items-start gap-2 p-2.5 bg-amber-50 border border-amber-100 rounded-lg text-sm">
-                              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-                              <span className="text-amber-800">
-                                <span className="font-medium">{DAY_NUM_TO_SHORT[r.day]} {r.hour}. ders</span>
-                                {' — '}
-                                <span className="font-semibold">{r.className}</span> → {r.classValue},
-                                ancak <span className="font-semibold">{r.teacherName}</span> programında bu saat boş
-                              </span>
-                            </div>
-                          ))}
-                        {validationReport.reverseIssues
-                          .filter(r => r.status === 'teacher_mismatch')
-                          .map((r, i) => (
-                            <div key={`rm-${i}`} className="flex items-start gap-2 p-2.5 bg-red-50 border border-red-100 rounded-lg text-sm">
-                              <XIcon className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-                              <span className="text-red-800">
-                                <span className="font-medium">{DAY_NUM_TO_SHORT[r.day]} {r.hour}. ders</span>
-                                {' — '}
-                                <span className="font-semibold">{r.className}</span> → "{r.classValue}",
-                                ancak <span className="font-semibold">{r.teacherName}</span> programında "{r.teacherValue}" (farklı sınıf)
                               </span>
                             </div>
                           ))}
@@ -1562,6 +1310,7 @@ export default function SchedulesTab({
                                 <span className="font-semibold">{c.teacherName}</span> → {c.teacherValue}
                                 {' '}|{' '}
                                 <span className="font-semibold">{c.className}</span> → {c.classValue}
+                                {c.recognizedFromClass && <span className="text-emerald-600"> (öğretmen adı da tutuyor)</span>}
                               </span>
                             </div>
                           ))}

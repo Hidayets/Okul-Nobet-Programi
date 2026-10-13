@@ -3,7 +3,18 @@ import { format, parseISO, getDay, addDays, isSameWeek, isAfter, isBefore, endOf
 import { tr } from 'date-fns/locale';
 import { v4 as uuidv4 } from 'uuid';
 import { Calendar as CalendarIcon, UserX, UserCheck, RefreshCw, AlertTriangle, BarChart3, Clock, Printer, ChevronDown, ShieldAlert, Users, ArrowRightLeft, X, Plus } from 'lucide-react';
-import { Teacher, Assignment, Absence, Substitution, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes, AbsenceReason, ABSENCE_REASONS } from '../types';
+import { Teacher, Assignment, Absence, Substitution, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes, AbsenceReason, ABSENCE_REASONS, Location, canTeacherDutyOnDay } from '../types';
+import { assignVicePrincipalsToDates } from '../lib/vicePrincipalDuty';
+import { assignSubstitutes } from '../lib/substituteAssignment';
+import PrintPreview from './PrintPreview';
+
+function esc(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 interface Props {
   teachers: Teacher[];
@@ -15,13 +26,16 @@ interface Props {
   setSubstitutions: React.Dispatch<React.SetStateAction<Substitution[]>>;
   isAdmin: boolean;
   schoolInfo: SchoolInfo;
+  locations: Location[];
 }
 
-interface DistributionSummary {
-  perTeacher: { id: string; name: string; todayCount: number; cumulativeCount: number }[];
-  unassignedLessons: { hour: number; className: string; absentTeacherName: string }[];
-  totalAssigned: number;
-  totalUnassigned: number;
+interface LessonRow {
+  key: string;
+  hour: number;
+  className: string;
+  absentTeacherId: string;
+  absentTeacherName: string;
+  sub?: Substitution;
 }
 
 export default function DailyOperationsTab({
@@ -34,11 +48,13 @@ export default function DailyOperationsTab({
   setSubstitutions,
   isAdmin,
   schoolInfo,
+  locations,
 }: Props) {
   const settings = schoolInfo.settings ?? DEFAULT_SCHOOL_SETTINGS;
   const lessonTimes = useMemo(() => calculateLessonTimes(settings), [settings]);
   const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
-  const [summary, setSummary] = useState<DistributionSummary | null>(null);
+  const [countSearch, setCountSearch] = useState('');
+  const [printPreviewHtml, setPrintPreviewHtml] = useState<string | null>(null);
 
   const dayOfWeek = useMemo(() => {
     const date = parseISO(selectedDate);
@@ -58,27 +74,76 @@ export default function DailyOperationsTab({
     return teachers.filter((t) => dailyAssignments.some((a) => a.teacherId === t.id));
   }, [assignments, teachers, selectedDate]);
 
+  // Nöbetçi öğretmenlerin nöbet yerlerini bul
+  const dutyTeacherLocations = useMemo(() => {
+    const dailyAssignments = assignments.filter((a) => a.date === selectedDate);
+    const locationMap = new Map<string, Location[]>();
+    // Çift nöbetli öğretmenin yerleri Nöbet Yerleri sırasıyla listelenir.
+    for (const location of locations) {
+      for (const assignment of dailyAssignments) {
+        if (assignment.locationId !== location.id) continue;
+        const list = locationMap.get(assignment.teacherId) ?? [];
+        if (!list.includes(location)) list.push(location);
+        locationMap.set(assignment.teacherId, list);
+      }
+    }
+    return locationMap;
+  }, [assignments, selectedDate, locations]);
+
+  const allDutyDates = useMemo(
+    () => Array.from(new Set(assignments.map(a => a.date))).sort(),
+    [assignments],
+  );
+
+  const vpByDate = useMemo(
+    () => assignVicePrincipalsToDates(allDutyDates, schoolInfo.mudurYardimcilari),
+    [allDutyDates, schoolInfo.mudurYardimcilari],
+  );
+
+  const dutyVpForSelectedDay = vpByDate[selectedDate] ?? null;
+
+  const printSignatureVpNames = useMemo(() => {
+    if (dutyVpForSelectedDay) return [dutyVpForSelectedDay.name];
+    if (schoolInfo.mudurYardimcilari.length === 1) {
+      return [schoolInfo.mudurYardimcilari[0].name];
+    }
+    return [];
+  }, [dutyVpForSelectedDay, schoolInfo.mudurYardimcilari]);
+
   const absentIdSet = useMemo(() => {
     return new Set(dailyAbsences.map(a => a.teacherId));
   }, [dailyAbsences]);
 
   const [reasonPickerFor, setReasonPickerFor] = useState<string | null>(null);
   const [poolPickerTeacherId, setPoolPickerTeacherId] = useState<string | null>(null);
+  const [selectedHoursForAbsence, setSelectedHoursForAbsence] = useState<Set<number>>(new Set());
 
-  const handleManualAssign = (
+  /** `substituteTeacherId` boş ise ders görevlisiz bırakılır. Başarılıysa true döner. */
+  const setLessonSubstitute = (
     substituteTeacherId: string,
     absentTeacherId: string,
     hour: number,
     className: string,
-  ) => {
+  ): boolean => {
     const existing = substitutions.find(
       s => s.date === selectedDate && s.absentTeacherId === absentTeacherId && s.hour === hour && s.className === className,
     );
+    if (substituteTeacherId) {
+      const conflict = substitutions.find(
+        s => s.date === selectedDate && s.hour === hour && s.substituteTeacherId === substituteTeacherId && s.id !== existing?.id,
+      );
+      if (conflict) {
+        const name = teachers.find(t => t.id === substituteTeacherId)?.name ?? 'Bu öğretmen';
+        if (!confirm(`${name} ${hour}. saatte zaten ${conflict.className} sınıfında görevli.\n\n${className} sınıfı da ona verilsin mi? (İki sınıf birleştirilir)`)) {
+          return false;
+        }
+      }
+    }
     if (existing) {
       setSubstitutions(prev => prev.map(s =>
         s.id === existing.id ? { ...s, substituteTeacherId } : s,
       ));
-    } else {
+    } else if (substituteTeacherId) {
       setSubstitutions(prev => [
         ...prev,
         {
@@ -91,13 +156,38 @@ export default function DailyOperationsTab({
         },
       ]);
     }
-    setPoolPickerTeacherId(null);
+    return true;
+  };
+
+  const handleManualAssign = (
+    substituteTeacherId: string,
+    absentTeacherId: string,
+    hour: number,
+    className: string,
+  ) => {
+    if (setLessonSubstitute(substituteTeacherId, absentTeacherId, hour, className)) {
+      setPoolPickerTeacherId(null);
+    }
   };
 
   const handleMarkAbsent = (teacherId: string, reason: AbsenceReason) => {
-    setAbsences((prev) => [...prev, { id: uuidv4(), date: selectedDate, teacherId, reason }]);
+    const selectedHours = Array.from(selectedHoursForAbsence).sort((a, b) => (a as number) - (b as number));
+    setAbsences((prev) => [...prev, { 
+      id: uuidv4(), 
+      date: selectedDate, 
+      teacherId, 
+      reason,
+      hours: selectedHours.length > 0 ? selectedHours as number[] : undefined
+    }]);
+    // Devamsız öğretmen o saatlerde başkasının dersine görevli kalmasın.
+    const absentHours = new Set(selectedHours as number[]);
+    setSubstitutions((prev) => prev.map((s) => {
+      if (s.date !== selectedDate || s.substituteTeacherId !== teacherId) return s;
+      if (absentHours.size > 0 && !absentHours.has(s.hour)) return s;
+      return { ...s, substituteTeacherId: '' };
+    }));
     setReasonPickerFor(null);
-    setSummary(null);
+    setSelectedHoursForAbsence(new Set());
   };
 
   const handleMarkPresent = (teacherId: string) => {
@@ -129,7 +219,6 @@ export default function DailyOperationsTab({
     // Devamsızlık ve görevlendirmeleri temizle
     setAbsences((prev) => prev.filter((a) => !(a.date === selectedDate && a.teacherId === teacherId)));
     setSubstitutions((prev) => prev.filter((s) => !(s.date === selectedDate && s.absentTeacherId === teacherId)));
-    setSummary(null);
   };
 
   // Nöbetçi olduğu halde devamsız olan öğretmenler
@@ -154,11 +243,13 @@ export default function DailyOperationsTab({
     const today = parseISO(selectedDate);
     const weekEnd = endOfWeek(today, { weekStartsOn: 1 });
 
-    // Sonraki günlerdeki nöbet atamalarını bul
+    // Sonraki günlerdeki nöbet atamalarını bul (daha önce takas edilmiş olanlar hariç)
     const upcomingAssignments = assignments.filter(a => {
+      if (a.originalTeacherId) return false;
       const d = parseISO(a.date);
       return isAfter(d, today) && (isBefore(d, weekEnd) || isSameWeek(d, today, { weekStartsOn: 1 }));
     });
+    const onDutyToday = new Set(assignments.filter(a => a.date === selectedDate).map(a => a.teacherId));
 
     // Her devamsız nöbetçi için swap adayları
     const candidates: {
@@ -187,6 +278,12 @@ export default function DailyOperationsTab({
         if (!swapTeacher) return;
         if (absentIdSet.has(swapTeacher.id)) return;
         if (swapTeacher.dutyType === 'nobetDisi') return;
+        // Aday bugün zaten nöbetçiyse iki nöbet tutmuş olur.
+        if (onDutyToday.has(swapTeacher.id)) return;
+        // Devamsız öğretmen takas gününde de gelmeyecekse ya da o gün nöbet tutamıyorsa takas anlamsız.
+        if (absences.some(ab => ab.date === ua.date && ab.teacherId === absentT.id)) return;
+        if (!canTeacherDutyOnDay(absentT, getDay(parseISO(ua.date)))) return;
+        if (assignments.some(a => a.date === ua.date && a.teacherId === absentT.id)) return;
 
         // Swap adayı bugün müsait mi kontrol et (dersi yoksa)
         const swapScheduleToday = swapTeacher.schedule?.[dayOfWeek] || {};
@@ -219,7 +316,7 @@ export default function DailyOperationsTab({
     return Array.from(uniqueByCandidate.values())
       .sort((a, b) => a.swapDate.localeCompare(b.swapDate))
       .slice(0, 8);
-  }, [absentDutyTeachers, assignments, selectedDate, teachers, absentIdSet, dayOfWeek, settings.lessonCount]);
+  }, [absentDutyTeachers, assignments, absences, selectedDate, teachers, absentIdSet, dayOfWeek, settings.lessonCount]);
 
   const handleSwapDuty = (
     absentTeacherId: string,
@@ -302,26 +399,12 @@ export default function DailyOperationsTab({
       return;
     }
 
-    // Cumulative substitution counts from ALL dates (excluding today which we'll rebuild)
-    const cumulativeCounts: Record<string, number> = {};
-    availableDutyTeachers.forEach(t => { cumulativeCounts[t.id] = 0; });
+    const existingToday = substitutions.filter(s => s.date === selectedDate && s.substituteTeacherId).length;
+    if (existingToday > 0 && !confirm(`Bu tarihteki ${existingToday} görevlendirme (elle yapılanlar dahil) silinip yeniden dağıtılacak. Devam edilsin mi?`)) {
+      return;
+    }
 
-    substitutions
-      .filter(s => s.date !== selectedDate && s.substituteTeacherId)
-      .forEach(s => {
-        if (cumulativeCounts[s.substituteTeacherId] !== undefined) {
-          cumulativeCounts[s.substituteTeacherId]++;
-        }
-      });
-
-    const currentSubstitutions = substitutions.filter(s => s.date !== selectedDate);
     const newSubstitutions: Substitution[] = [];
-    const unassignedLessons: { hour: number; className: string; absentTeacherName: string }[] = [];
-
-    // Track today's assignments per teacher and per (teacherId, hour) slot
-    const todayCounts: Record<string, number> = {};
-    availableDutyTeachers.forEach(t => { todayCounts[t.id] = 0; });
-    const assignedSlots = new Set<string>(); // "teacherId-hour"
 
     // Collect all lessons that need coverage, sorted by hour for deterministic ordering
     const lessonsToAssign: { hour: number; className: string; absentTeacher: Teacher }[] = [];
@@ -331,12 +414,20 @@ export default function DailyOperationsTab({
       if (!teacher?.schedule?.[dayOfWeek]) return;
 
       const classesToday = teacher.schedule[dayOfWeek];
-      Object.entries(classesToday).forEach(([hourStr, className]) => {
-        lessonsToAssign.push({
-          hour: parseInt(hourStr, 10),
-          className,
-          absentTeacher: teacher,
-        });
+      // Eğer absence.hours belirtilmişse sadece o saatleri işle, yoksa tüm gün
+      const hoursToProcess = absence.hours && absence.hours.length > 0 
+        ? absence.hours 
+        : Object.keys(classesToday).map(Number);
+      
+      hoursToProcess.forEach(hour => {
+        const className = classesToday[hour];
+        if (className) {
+          lessonsToAssign.push({
+            hour,
+            className,
+            absentTeacher: teacher,
+          });
+        }
       });
     });
 
@@ -348,100 +439,275 @@ export default function DailyOperationsTab({
       return;
     }
 
-    for (const lesson of lessonsToAssign) {
-      const { hour, className, absentTeacher } = lesson;
+    const previousCounts = new Map<string, number>();
+    substitutions.forEach(s => {
+      if (s.date === selectedDate || !s.substituteTeacherId) return;
+      previousCounts.set(s.substituteTeacherId, (previousCounts.get(s.substituteTeacherId) ?? 0) + 1);
+    });
 
-      // Filter candidates: not absent, free at this hour (no own class), not already covering another class this hour
-      const candidates = availableDutyTeachers.filter(dt => {
-        const hasOwnClass = !!dt.schedule?.[dayOfWeek]?.[hour];
-        const alreadyAssignedThisHour = assignedSlots.has(`${dt.id}-${hour}`);
-        return !hasOwnClass && !alreadyAssignedThisHour;
-      });
+    const neededHours = [...new Set(lessonsToAssign.map(l => l.hour))];
+    const chosenIds = assignSubstitutes(
+      lessonsToAssign,
+      availableDutyTeachers.map(dt => ({
+        id: dt.id,
+        freeHours: new Set(neededHours.filter(h => !dt.schedule?.[dayOfWeek]?.[h])),
+        previousCount: previousCounts.get(dt.id) ?? 0,
+      })),
+      { allowMerge: true },
+    );
 
-      if (candidates.length === 0) {
-        unassignedLessons.push({
-          hour,
-          className,
-          absentTeacherName: absentTeacher.name,
-        });
-        continue;
-      }
-
-      // Pick the candidate with the lowest cumulative count; tie-break by today's count
-      candidates.sort((a, b) => {
-        const cumDiff = cumulativeCounts[a.id] - cumulativeCounts[b.id];
-        if (cumDiff !== 0) return cumDiff;
-        return todayCounts[a.id] - todayCounts[b.id];
-      });
-
-      const chosen = candidates[0];
-
+    lessonsToAssign.forEach(({ hour, className, absentTeacher }, i) => {
+      const chosenId = chosenIds[i];
+      if (!chosenId) return;
       newSubstitutions.push({
         id: uuidv4(),
         date: selectedDate,
         hour,
         className,
         absentTeacherId: absentTeacher.id,
-        substituteTeacherId: chosen.id,
+        substituteTeacherId: chosenId,
       });
-
-      todayCounts[chosen.id]++;
-      cumulativeCounts[chosen.id]++;
-      assignedSlots.add(`${chosen.id}-${hour}`);
-    }
-
-    setSubstitutions([...currentSubstitutions, ...newSubstitutions]);
-
-    setSummary({
-      perTeacher: availableDutyTeachers.map(t => ({
-        id: t.id,
-        name: t.name,
-        todayCount: todayCounts[t.id],
-        cumulativeCount: cumulativeCounts[t.id],
-      })).sort((a, b) => b.todayCount - a.todayCount),
-      unassignedLessons,
-      totalAssigned: newSubstitutions.length,
-      totalUnassigned: unassignedLessons.length,
     });
+
+    setSubstitutions(prev => [...prev.filter(s => s.date !== selectedDate), ...newSubstitutions]);
   };
+
+  // Devamsız öğretmenlerin bugün boş kalan dersleri ve varsa görevlendirme kayıtları
+  const lessonRows = useMemo<LessonRow[]>(() => {
+    const rows: LessonRow[] = [];
+    const matched = new Set<string>();
+    dailyAbsences.forEach(absence => {
+      const teacher = teachers.find(t => t.id === absence.teacherId);
+      const classesToday = teacher?.schedule?.[dayOfWeek];
+      if (!teacher || !classesToday) return;
+      const hours = absence.hours && absence.hours.length > 0
+        ? absence.hours
+        : Object.keys(classesToday).map(Number);
+      hours.forEach(hour => {
+        const className = classesToday[hour];
+        if (!className) return;
+        const sub = dailySubstitutions.find(
+          s => s.absentTeacherId === teacher.id && s.hour === hour && s.className === className,
+        );
+        if (sub) matched.add(sub.id);
+        rows.push({
+          key: `${teacher.id}-${hour}-${className}`,
+          hour,
+          className,
+          absentTeacherId: teacher.id,
+          absentTeacherName: teacher.name,
+          sub,
+        });
+      });
+    });
+    dailySubstitutions.forEach(sub => {
+      if (matched.has(sub.id)) return;
+      rows.push({
+        key: sub.id,
+        hour: sub.hour,
+        className: sub.className,
+        absentTeacherId: sub.absentTeacherId,
+        absentTeacherName: teachers.find(t => t.id === sub.absentTeacherId)?.name ?? 'Bilinmiyor',
+        sub,
+      });
+    });
+    return rows.sort((a, b) => a.hour - b.hour || a.absentTeacherName.localeCompare(b.absentTeacherName, 'tr'));
+  }, [dailyAbsences, dailySubstitutions, teachers, dayOfWeek]);
+
+  // Görevlendirme sayıları her zaman kayıtlardan hesaplanır; elle yapılan değişiklikler de anında yansır.
+  const substitutionCounts = useMemo(() => {
+    const total = new Map<string, number>();
+    const month = new Map<string, number>();
+    const today = new Map<string, number>();
+    const lastDate = new Map<string, string>();
+    const monthKey = selectedDate.slice(0, 7);
+    substitutions.forEach(s => {
+      const id = s.substituteTeacherId;
+      if (!id) return;
+      total.set(id, (total.get(id) ?? 0) + 1);
+      if (s.date.startsWith(monthKey)) month.set(id, (month.get(id) ?? 0) + 1);
+      if (s.date === selectedDate) today.set(id, (today.get(id) ?? 0) + 1);
+      if ((lastDate.get(id) ?? '') < s.date) lastDate.set(id, s.date);
+    });
+    return { total, month, today, lastDate };
+  }, [substitutions, selectedDate]);
+
+  const isAbsentAtHour = (teacherId: string, hour: number) =>
+    dailyAbsences.some(a => a.teacherId === teacherId && (!a.hours || a.hours.length === 0 || a.hours.includes(hour)));
+
+  const getSubstituteOptions = (row: LessonRow) => {
+    const busyIds = new Set(
+      dailySubstitutions
+        .filter(s => s.hour === row.hour && s.substituteTeacherId && s.id !== row.sub?.id)
+        .map(s => s.substituteTeacherId),
+    );
+    const dutyIds = new Set(dutyTeachers.map(t => t.id));
+    const canCover = (t: Teacher) =>
+      t.id !== row.absentTeacherId && !isAbsentAtHour(t.id, row.hour) && !t.schedule?.[dayOfWeek]?.[row.hour];
+    const eligible = teachers.filter(t => {
+      if (t.id === row.sub?.substituteTeacherId) return true;
+      return canCover(t) && !busyIds.has(t.id);
+    });
+    const byLoad = (a: Teacher, b: Teacher) =>
+      (substitutionCounts.today.get(a.id) ?? 0) - (substitutionCounts.today.get(b.id) ?? 0) ||
+      (substitutionCounts.total.get(a.id) ?? 0) - (substitutionCounts.total.get(b.id) ?? 0) ||
+      a.name.localeCompare(b.name, 'tr');
+    return {
+      duty: eligible.filter(t => dutyIds.has(t.id)).sort(byLoad),
+      others: eligible.filter(t => !dutyIds.has(t.id)).sort(byLoad),
+      merge: dutyTeachers
+        .filter(t => busyIds.has(t.id) && t.id !== row.sub?.substituteTeacherId && canCover(t))
+        .sort(byLoad),
+    };
+  };
+
+  /** Aynı saatte aynı görevliye verilen diğer sınıflar (birleştirilmiş dersler). */
+  const mergedClassesFor = (row: LessonRow): string[] => {
+    const subId = row.sub?.substituteTeacherId;
+    if (!subId) return [];
+    return dailySubstitutions
+      .filter(s => s.hour === row.hour && s.substituteTeacherId === subId && s.id !== row.sub?.id)
+      .map(s => s.className);
+  };
+
+  const formatOptionLabel = (t: Teacher) => {
+    const todayCount = substitutionCounts.today.get(t.id) ?? 0;
+    const totalCount = substitutionCounts.total.get(t.id) ?? 0;
+    return `${t.name} — bugün ${todayCount}, toplam ${totalCount}${t.dutyType === 'nobetDisi' ? ' (nöbet dışı)' : ''}`;
+  };
+
+  const liveDistribution = useMemo(() => {
+    const ids = new Set<string>(dutyTeachers.filter(t => !absentIdSet.has(t.id)).map(t => t.id));
+    substitutionCounts.today.forEach((_, id) => ids.add(id));
+    const perTeacher = Array.from(ids)
+      .map(id => {
+        const teacher = teachers.find(t => t.id === id);
+        if (!teacher) return null;
+        return {
+          id,
+          name: teacher.name,
+          isDuty: dutyTeachers.some(t => t.id === id),
+          todayCount: substitutionCounts.today.get(id) ?? 0,
+          totalCount: substitutionCounts.total.get(id) ?? 0,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null)
+      .sort((a, b) => b.todayCount - a.todayCount || a.name.localeCompare(b.name, 'tr'));
+    const unassigned = lessonRows.filter(r => !r.sub?.substituteTeacherId);
+    return {
+      perTeacher,
+      unassigned,
+      totalAssigned: lessonRows.length - unassigned.length,
+    };
+  }, [dutyTeachers, absentIdSet, substitutionCounts, teachers, lessonRows]);
+
+  const teacherCountRows = useMemo(() => {
+    const query = countSearch.trim().toLocaleLowerCase('tr');
+    return teachers
+      .filter(t => !query || t.name.toLocaleLowerCase('tr').includes(query))
+      .map(t => ({
+        teacher: t,
+        total: substitutionCounts.total.get(t.id) ?? 0,
+        month: substitutionCounts.month.get(t.id) ?? 0,
+        today: substitutionCounts.today.get(t.id) ?? 0,
+        lastDate: substitutionCounts.lastDate.get(t.id),
+      }))
+      .sort((a, b) => b.total - a.total || a.teacher.name.localeCompare(b.teacher.name, 'tr'));
+  }, [teachers, substitutionCounts, countSearch]);
 
   const formattedDate = format(parseISO(selectedDate), 'dd MMMM yyyy EEEE', { locale: tr });
 
   const printableGrid = useMemo(() => {
-    // Sadece substitute atanmış kayıtları al
-    const subsWithAssignment = dailySubstitutions.filter(s => s.substituteTeacherId);
-    if (subsWithAssignment.length === 0) return [];
+    if (dailyAbsences.length === 0) return [];
 
-    const absentTeacherIds = [...new Set(subsWithAssignment.map(s => s.absentTeacherId))];
-    return absentTeacherIds.map(absentId => {
-      const teacher = teachers.find(t => t.id === absentId);
-      const subs = subsWithAssignment.filter(s => s.absentTeacherId === absentId);
+    return dailyAbsences.map(absence => {
+      const teacher = teachers.find(t => t.id === absence.teacherId);
+      const reasonLabel = absence.reason
+        ? ABSENCE_REASONS.find(r => r.id === absence.reason)?.label ?? '-'
+        : '-';
+      const schedule = teacher?.schedule?.[dayOfWeek] ?? {};
 
-      const hours: Record<number, { className: string; substitute: string }> = {};
-      // Substitution kayıtlarından saatleri al (schedule yerine)
-      subs.forEach(sub => {
-        const substituteName = teachers.find(t => t.id === sub.substituteTeacherId)?.name || '';
-        hours[sub.hour] = { className: sub.className, substitute: substituteName };
-      });
+      const classesByHour: Record<number, string> = {};
+      const substitutesByHour: Record<number, string> = {};
+      for (let h = 1; h <= settings.lessonCount; h++) {
+        const className = schedule[h];
+        classesByHour[h] = className || '-';
+        if (className) {
+          const sub = dailySubstitutions.find(
+            s => s.absentTeacherId === absence.teacherId && s.hour === h && s.substituteTeacherId,
+          );
+          substitutesByHour[h] = sub
+            ? teachers.find(t => t.id === sub.substituteTeacherId)?.name ?? '-'
+            : '-';
+        } else {
+          substitutesByHour[h] = '-';
+        }
+      }
 
       return {
-        absentName: teacher?.name || '-',
-        hours,
+        absentName: teacher?.name ?? '-',
+        reasonLabel,
+        classesByHour,
+        substitutesByHour,
       };
-    }).filter(row => Object.keys(row.hours).length > 0);
-  }, [dailySubstitutions, teachers]);
+    });
+  }, [dailyAbsences, dailySubstitutions, teachers, dayOfWeek, settings.lessonCount]);
 
   const okulAdi = schoolInfo.okulAdi || '';
   const mudur = schoolInfo.okulMuduru || '';
-  const yardimcilar = (schoolInfo.mudurYardimcilari || []).map(v => v.name);
 
   const handlePrintSubstitutions = () => {
     if (printableGrid.length === 0) {
-      alert('Yazdırılacak görevlendirme bulunmuyor. Önce "Otomatik Dağıt" ile görevlendirme yapın.');
+      alert('Yazdırılacak devamsız öğretmen bulunmuyor.');
       return;
     }
-    
-    // Print için HTML oluştur
+
+    const lessonHeaders = Array.from(
+      { length: settings.lessonCount },
+      (_, i) => `<th>${i + 1}. Ders</th>`,
+    ).join('');
+
+    const absentSections = printableGrid.map(row => `
+      <div class="teacher-block">
+        <table class="info-table">
+          <tr>
+            <td class="info-label">Gelmeyen Öğretmen</td>
+            <td class="info-value">${esc(row.absentName)}</td>
+            <td class="info-label">Gelmeme Sebebi</td>
+            <td class="info-value">${esc(row.reasonLabel)}</td>
+          </tr>
+        </table>
+        <table class="schedule-table">
+          <thead>
+            <tr>
+              <th class="row-label"></th>
+              ${lessonHeaders}
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="row-label">Sınıf</td>
+              ${Array.from({ length: settings.lessonCount }, (_, i) => {
+                const val = row.classesByHour[i + 1];
+                return `<td class="${val === '-' ? 'empty-cell' : 'class-cell'}">${esc(val)}</td>`;
+              }).join('')}
+            </tr>
+            <tr>
+              <td class="row-label">Görevlendirilen Öğretmen</td>
+              ${Array.from({ length: settings.lessonCount }, (_, i) => {
+                const classVal = row.classesByHour[i + 1];
+                const subVal = row.substitutesByHour[i + 1];
+                const display = classVal !== '-' && subVal !== '-'
+                  ? `${esc(subVal)}<br><span class="sub-class">(${esc(classVal)})</span>`
+                  : '-';
+                return `<td class="${display === '-' ? 'empty-cell' : 'sub-cell'}">${display}</td>`;
+              }).join('')}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    `).join('');
+
     const printHtml = `
       <!DOCTYPE html>
       <html>
@@ -450,144 +716,198 @@ export default function DailyOperationsTab({
         <title>Ders Görevlendirme Çizelgesi</title>
         <style>
           @page { size: landscape; margin: 1cm; }
-          body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; }
-          .header { text-align: center; margin-bottom: 20px; }
+          .daily-print-sheet, .daily-print-sheet * { box-sizing: border-box; }
+          .daily-print-sheet { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 16px; color: #0f172a; }
+          .page-frame {
+            border: 2px solid #000;
+            padding: 16px;
+          }
+          .header { text-align: center; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 2px solid #000; }
           .header div { margin-bottom: 2px; }
-          table { border-collapse: collapse; width: 100%; }
-          th, td { border: 1.5px solid #000; padding: 8px 10px; font-size: 12px; }
-          th { background-color: #e2e8f0; font-weight: 700; text-align: center; }
-          td { text-align: center; }
-          td.name-cell { text-align: left; font-weight: 700; padding-left: 12px; }
-          .row-separator { border-bottom: 3px solid #000 !important; }
-          .signatures { display: flex; justify-content: space-between; margin-top: 60px; padding: 0 20px; }
+          .teacher-block {
+            border: 2px solid #000;
+            margin-bottom: 14px;
+            padding: 0;
+            page-break-inside: avoid;
+          }
+          .teacher-block:last-of-type { margin-bottom: 0; }
+          .daily-print-sheet table { border-collapse: collapse; width: 100%; }
+          .info-table td {
+            border: 1.5px solid #000;
+            padding: 7px 10px;
+            font-size: 12px;
+          }
+          .info-label {
+            font-weight: 700;
+            background-color: #e2e8f0;
+            width: 18%;
+            text-align: left;
+          }
+          .info-value { font-weight: 600; width: 32%; }
+          .schedule-table th,
+          .schedule-table td {
+            border: 1.5px solid #000;
+            padding: 7px 6px;
+            font-size: 11px;
+            text-align: center;
+            vertical-align: middle;
+          }
+          .schedule-table th {
+            background-color: #e2e8f0;
+            font-weight: 700;
+          }
+          .row-label {
+            text-align: left;
+            font-weight: 700;
+            padding-left: 10px !important;
+            background-color: #f1f5f9;
+            min-width: 130px;
+            width: 130px;
+          }
+          .class-cell { font-weight: 600; }
+          .sub-cell { font-weight: 600; line-height: 1.3; }
+          .sub-class { font-size: 10px; font-weight: 500; color: #334155; }
+          .empty-cell { color: #64748b; }
+          .signatures {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 40px;
+            padding: 16px 20px 0;
+            border-top: 2px solid #000;
+          }
           .signature-box { text-align: center; min-width: 140px; }
           .signature-title { font-size: 10px; margin-bottom: 40px; }
-          .signature-name { font-size: 11px; font-weight: 700; border-top: 1.5px solid #000; padding-top: 4px; }
+          .signature-name {
+            font-size: 11px;
+            font-weight: 700;
+            border-top: 1.5px solid #000;
+            padding-top: 4px;
+          }
         </style>
       </head>
       <body>
-        <div class="header">
-          ${schoolInfo.valilik ? `<div style="font-size: 11px; font-weight: 700;">T.C.</div>` : ''}
-          ${schoolInfo.valilik ? `<div style="font-size: 11px; font-weight: 700;">${schoolInfo.valilik.toLocaleUpperCase('tr-TR')} VALİLİĞİ</div>` : ''}
-          ${schoolInfo.kaymakamlik ? `<div style="font-size: 11px; font-weight: 700;">${schoolInfo.kaymakamlik.toLocaleUpperCase('tr-TR')} KAYMAKAMLIĞI</div>` : ''}
-          ${okulAdi ? `<div style="font-size: 13px; font-weight: 700; margin-bottom: 8px;">${okulAdi.toLocaleUpperCase('tr-TR')}</div>` : ''}
-          <div style="font-size: 14px; font-weight: 700; margin-bottom: 6px;">DERS GÖREVLENDİRME ÇİZELGESİ</div>
-          <div style="font-size: 12px; font-weight: 600;">${formattedDate}</div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th style="text-align: left; padding-left: 12px; min-width: 140px;">Gelmeyen Öğretmen</th>
-              ${Array.from({ length: settings.lessonCount }, (_, i) => `<th>${i + 1}. Ders</th>`).join('')}
-            </tr>
-          </thead>
-          <tbody>
-            ${printableGrid.map((row, ri) => `
-              <tr>
-                <td class="name-cell">${row.absentName}</td>
-                ${Array.from({ length: settings.lessonCount }, (_, i) => `<td style="font-weight: 600;">${row.hours[i + 1]?.className || ''}</td>`).join('')}
-              </tr>
-              <tr class="${ri < printableGrid.length - 1 ? 'row-separator' : ''}">
-                <td class="name-cell">Görevlendirilenler</td>
-                ${Array.from({ length: settings.lessonCount }, (_, i) => `<td>${row.hours[i + 1]?.substitute || ''}</td>`).join('')}
-              </tr>
+        <div class="daily-print-sheet">
+        <div class="page-frame">
+          <div class="header">
+            ${schoolInfo.valilik ? `<div style="font-size: 11px; font-weight: 700;">T.C.</div>` : ''}
+            ${schoolInfo.valilik ? `<div style="font-size: 11px; font-weight: 700;">${esc(schoolInfo.valilik.toLocaleUpperCase('tr-TR'))} VALİLİĞİ</div>` : ''}
+            ${schoolInfo.kaymakamlik ? `<div style="font-size: 11px; font-weight: 700;">${esc(schoolInfo.kaymakamlik.toLocaleUpperCase('tr-TR'))} KAYMAKAMLIĞI</div>` : ''}
+            ${okulAdi ? `<div style="font-size: 13px; font-weight: 700; margin-bottom: 8px;">${esc(okulAdi.toLocaleUpperCase('tr-TR'))}</div>` : ''}
+            <div style="font-size: 14px; font-weight: 700; margin-bottom: 6px;">DERS GÖREVLENDİRME ÇİZELGESİ</div>
+            <div style="font-size: 12px; font-weight: 600;">${formattedDate}</div>
+          </div>
+          ${absentSections}
+          <div class="signatures">
+            ${printSignatureVpNames.map(name => `
+              <div class="signature-box">
+                <div class="signature-title">Nöbetçi Müdür Yardımcısı</div>
+                <div class="signature-name">${esc(name)}</div>
+              </div>
             `).join('')}
-          </tbody>
-        </table>
-        <div class="signatures">
-          ${yardimcilar.map(name => `
-            <div class="signature-box">
-              <div class="signature-title">Müdür Yardımcısı</div>
-              <div class="signature-name">${name}</div>
-            </div>
-          `).join('')}
-          ${mudur ? `
-            <div class="signature-box">
-              <div class="signature-title">Okul Müdürü</div>
-              <div class="signature-name">${mudur}</div>
-            </div>
-          ` : ''}
+            ${mudur ? `
+              <div class="signature-box">
+                <div class="signature-title">Okul Müdürü</div>
+                <div class="signature-name">${esc(mudur)}</div>
+              </div>
+            ` : ''}
+          </div>
+        </div>
         </div>
       </body>
       </html>
     `;
 
-    // Yeni pencere aç ve yazdır
-    const printWindow = window.open('', '_blank', 'width=800,height=600');
-    if (printWindow) {
-      printWindow.document.write(printHtml);
-      printWindow.document.close();
-      printWindow.onload = () => {
-        printWindow.focus();
-        printWindow.print();
-        printWindow.close();
-      };
-    }
+    const styleMatch = printHtml.match(/<style>([\s\S]*?)<\/style>/);
+    const bodyMatch = printHtml.match(/<body>([\s\S]*?)<\/body>/);
+    setPrintPreviewHtml(`${styleMatch ? `<style>${styleMatch[1]}</style>` : ''}${bodyMatch ? bodyMatch[1] : ''}`);
   };
 
   return (
     <div className="space-y-6">
+      {printPreviewHtml && (
+        <PrintPreview
+          title="Ders görevlendirme çizelgesi"
+          html={printPreviewHtml}
+          page="landscape"
+          onClose={() => setPrintPreviewHtml(null)}
+        />
+      )}
       <div className="bg-surface p-6 rounded-xl shadow-sm border border-slate-200">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
           <div>
             <h2 className="text-lg font-semibold">Günlük İşlemler</h2>
             <p className="text-sm text-slate-500">Devamsızlık ve ders boşluk doldurma işlemleri</p>
           </div>
-          <div className="relative">
-            <CalendarIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
-            <input
-              type="date"
-              value={selectedDate}
-              onChange={(e) => { setSelectedDate(e.target.value); setSummary(null); }}
-              className="pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            />
+          <div className="flex flex-col items-stretch sm:items-end gap-2">
+            <div className="relative">
+              <CalendarIcon className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => {
+                  if (!e.target.value) return;
+                  setSelectedDate(e.target.value);
+                }}
+                className="pl-10 pr-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 w-full sm:w-auto"
+              />
+            </div>
+            {dutyVpForSelectedDay && (
+              <div className="text-sm text-slate-600 bg-indigo-50 border border-indigo-100 px-3 py-2 rounded-lg text-center sm:text-right">
+                <span className="text-slate-500">Nöbetçi Md. Yrd.:</span>{' '}
+                <span className="font-semibold text-indigo-800">{dutyVpForSelectedDay.name}</span>
+              </div>
+            )}
           </div>
         </div>
       </div>
 
       {/* Distribution Summary */}
-      {summary && (
+      {lessonRows.length > 0 && (
         <div className="bg-surface rounded-xl shadow-sm border border-slate-200 overflow-hidden">
           <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex items-center gap-2">
             <BarChart3 className="w-5 h-5 text-indigo-600" />
             <h3 className="font-semibold text-slate-800">Dağıtım Özeti</h3>
+            <span className="text-xs text-slate-400 ml-auto">Elle yapılan değişiklikler anında yansır</span>
           </div>
           <div className="p-4 space-y-4">
             <div className="flex gap-3 flex-wrap">
               <div className="bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg text-sm font-medium">
-                Atanan: {summary.totalAssigned} ders
+                Atanan: {liveDistribution.totalAssigned} ders
               </div>
-              {summary.totalUnassigned > 0 && (
+              {liveDistribution.unassigned.length > 0 && (
                 <div className="bg-amber-50 text-amber-700 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5">
                   <AlertTriangle className="w-4 h-4" />
-                  Atanamayan: {summary.totalUnassigned} ders
+                  Görevlisiz: {liveDistribution.unassigned.length} ders
                 </div>
               )}
             </div>
 
-            {/* Per-teacher stats */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-              {summary.perTeacher.map(pt => (
+              {liveDistribution.perTeacher.map(pt => (
                 <div key={pt.id} className="flex items-center justify-between p-2.5 rounded-lg border border-slate-100 bg-slate-50/50">
-                  <span className="text-sm font-medium text-slate-700 truncate mr-2">{pt.name}</span>
+                  <span className="text-sm font-medium text-slate-700 truncate mr-2">
+                    {pt.name}
+                    {!pt.isDuty && <span className="ml-1 text-[10px] text-violet-600">(geçici)</span>}
+                  </span>
                   <div className="flex items-center gap-2 flex-shrink-0">
                     <span className="text-xs font-semibold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">
                       Bugün: {pt.todayCount}
                     </span>
                     <span className="text-xs font-medium text-slate-400">
-                      Top: {pt.cumulativeCount}
+                      Toplam: {pt.totalCount}
                     </span>
                   </div>
                 </div>
               ))}
             </div>
 
-            {/* Unassigned warnings */}
-            {summary.unassignedLessons.length > 0 && (
+            {liveDistribution.unassigned.length > 0 && (
               <div className="space-y-2">
-                <p className="text-sm font-medium text-amber-700">Atanamayan Dersler (nöbetçi müsait değil):</p>
-                {summary.unassignedLessons.map((ul, i) => (
-                  <div key={i} className="flex items-center gap-2 p-2.5 rounded-lg border border-amber-200 bg-amber-50/50 text-sm">
+                <p className="text-sm font-medium text-amber-700">
+                  Görevlisiz Dersler{isAdmin ? ' (aşağıdaki listeden elle atayabilirsiniz)' : ''}:
+                </p>
+                {liveDistribution.unassigned.map(ul => (
+                  <div key={ul.key} className="flex items-center gap-2 p-2.5 rounded-lg border border-amber-200 bg-amber-50/50 text-sm">
                     <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0" />
                     <span className="text-amber-800">
                       <span className="font-semibold">{ul.hour}. ders</span> — {ul.className} ({ul.absentTeacherName})
@@ -609,7 +929,11 @@ export default function DailyOperationsTab({
           </div>
           <div className="p-4 max-h-[500px] overflow-y-auto">
             <div className="space-y-2">
-              {teachers.map((teacher) => {
+              {teachers.filter(t => {
+                const schedule = t.schedule?.[dayOfWeek];
+                // Sadece o gün dersi olan öğretmenleri göster (schedule varsa ve boş değilse)
+                return schedule && Object.keys(schedule).length > 0;
+              }).map((teacher) => {
                 const absence = dailyAbsences.find((a) => a.teacherId === teacher.id);
                 const isAbsent = !!absence;
                 const isDuty = dutyTeachers.some(dt => dt.id === teacher.id);
@@ -629,9 +953,17 @@ export default function DailyOperationsTab({
                           {teacher.name}
                         </span>
                         {isDuty && (
-                          <span className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">
-                            Nöbetçi
-                          </span>
+                          <>
+                            <span className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">
+                              Nöbetçi
+                            </span>
+                            {(dutyTeacherLocations.get(teacher.id)?.length ?? 0) > 0 && (
+                              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">
+                                {dutyTeacherLocations.get(teacher.id)!.map(l => l.name).join(' + ')}
+                                {dutyTeacherLocations.get(teacher.id)!.length > 1 && ' (2x)'}
+                              </span>
+                            )}
+                          </>
                         )}
                         {reasonInfo && (
                           <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-600">
@@ -645,6 +977,9 @@ export default function DailyOperationsTab({
                             handleMarkPresent(teacher.id);
                           } else if (isAdmin) {
                             setReasonPickerFor(isReasonOpen ? null : teacher.id);
+                            if (!isReasonOpen) {
+                              setSelectedHoursForAbsence(new Set());
+                            }
                           }
                         }}
                         disabled={!isAdmin}
@@ -668,16 +1003,56 @@ export default function DailyOperationsTab({
                     </div>
 
                     {isReasonOpen && (
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        {ABSENCE_REASONS.map(r => (
-                          <button
-                            key={r.id}
-                            onClick={() => handleMarkAbsent(teacher.id, r.id)}
-                            className="px-3 py-1.5 rounded-md text-xs font-medium bg-red-100 text-red-700 hover:bg-red-200 transition-colors border border-red-200"
-                          >
-                            {r.label}
-                          </button>
-                        ))}
+                      <div className="mt-2 space-y-3">
+                        {/* Saat seçimi */}
+                        <div>
+                          <p className="text-xs font-medium text-slate-600 mb-2">Devamsız olunan saatleri seçin (boş bırakırsanız tüm gün):</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {Array.from({ length: settings.lessonCount }, (_, i) => i + 1).map(hour => {
+                              const hasClass = teacher.schedule?.[dayOfWeek]?.[hour];
+                              if (!hasClass) return null;
+                              const isSelected = selectedHoursForAbsence.has(hour);
+                              return (
+                                <button
+                                  key={hour}
+                                  onClick={() => {
+                                    setSelectedHoursForAbsence(prev => {
+                                      const newSet = new Set(prev);
+                                      if (newSet.has(hour)) {
+                                        newSet.delete(hour);
+                                      } else {
+                                        newSet.add(hour);
+                                      }
+                                      return newSet;
+                                    });
+                                  }}
+                                  className={`px-2 py-1 rounded-md text-xs font-medium border transition-colors ${
+                                    isSelected
+                                      ? 'bg-red-100 border-red-300 text-red-700'
+                                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                                  }`}
+                                >
+                                  {hour}. ders
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        {/* Sebep seçimi */}
+                        <div>
+                          <p className="text-xs font-medium text-slate-600 mb-2">Sebep:</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {ABSENCE_REASONS.map(r => (
+                              <button
+                                key={r.id}
+                                onClick={() => handleMarkAbsent(teacher.id, r.id)}
+                                className="px-3 py-1.5 rounded-md text-xs font-medium bg-red-100 text-red-700 hover:bg-red-200 transition-colors border border-red-200"
+                              >
+                                {r.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -692,7 +1067,7 @@ export default function DailyOperationsTab({
           <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex justify-between items-center">
             <h3 className="font-semibold text-slate-800">Ders Görevlendirmeleri</h3>
             <div className="flex items-center gap-2">
-              {dailySubstitutions.length > 0 && (
+              {dailyAbsences.length > 0 && (
                 <button
                   onClick={handlePrintSubstitutions}
                   className="bg-slate-600 hover:bg-slate-700 text-white px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-2 transition-colors"
@@ -717,24 +1092,28 @@ export default function DailyOperationsTab({
           <div className="p-6 flex-1 overflow-y-auto">
             {dailyAbsences.length === 0 ? (
               <div className="text-center text-slate-500 mt-10">
-                Bugün için devamsız öğretmen bulunmuyor.
+                Bu tarih için devamsız öğretmen bulunmuyor.
               </div>
-            ) : dailySubstitutions.length === 0 ? (
+            ) : lessonRows.length === 0 ? (
               <div className="text-center text-slate-500 mt-10">
-                {isAdmin ? 'Devamsız öğretmenlerin dersleri var. Dağıtmak için "Otomatik Dağıt" butonuna tıklayın.' : 'Henüz ders görevlendirmesi yapılmadı.'}
+                Devamsız öğretmenlerin ders programı bulunamadı. Öğretmen programlarını "Ders Programları" sekmesinden yükleyin.
               </div>
             ) : (
               <div className="space-y-3">
-                {dailySubstitutions
-                  .sort((a, b) => a.hour - b.hour)
-                  .map((sub) => {
-                    const absentTeacher = teachers.find((t) => t.id === sub.absentTeacherId);
-                    const substituteTeacher = sub.substituteTeacherId
+                {isAdmin && dailySubstitutions.length === 0 && (
+                  <div className="text-sm text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                    "Otomatik Dağıt" ile dağıtabilir ya da her ders için görevliyi aşağıdan elle seçebilirsiniz.
+                  </div>
+                )}
+                {lessonRows.map((row) => {
+                    const sub = row.sub;
+                    const substituteTeacher = sub?.substituteTeacherId
                       ? teachers.find((t) => t.id === sub.substituteTeacherId)
                       : null;
-                    const isUnassigned = !sub.substituteTeacherId;
+                    const isUnassigned = !sub?.substituteTeacherId;
+                    const options = isAdmin ? getSubstituteOptions(row) : null;
 
-                    const lt = lessonTimes.find(l => l.lesson === sub.hour);
+                    const lt = lessonTimes.find(l => l.lesson === row.hour);
 
                     // Check if substitute has own class at a different hour (show "boş ders" badge)
                     const subHasScheduleToday = substituteTeacher?.schedule?.[dayOfWeek];
@@ -744,7 +1123,7 @@ export default function DailyOperationsTab({
 
                     return (
                       <div
-                        key={sub.id}
+                        key={row.key}
                         className={`p-4 rounded-lg border ${
                           isUnassigned
                             ? 'border-amber-300 bg-amber-50/70'
@@ -756,7 +1135,7 @@ export default function DailyOperationsTab({
                             <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
                               isUnassigned ? 'bg-amber-100 text-amber-800' : 'bg-indigo-100 text-indigo-800'
                             }`}>
-                              {sub.hour}. Ders
+                              {row.hour}. Ders
                             </span>
                             {lt && (
                               <span className="text-xs text-slate-400 flex items-center gap-1">
@@ -765,14 +1144,54 @@ export default function DailyOperationsTab({
                               </span>
                             )}
                           </div>
-                          <span className="font-semibold text-slate-800">{sub.className}</span>
+                          <span className="font-semibold text-slate-800">{row.className}</span>
                         </div>
                         <div className="text-sm text-slate-600 space-y-1">
-                          <p><span className="text-slate-400">Gelmeyen:</span> {absentTeacher?.name}</p>
-                          {isUnassigned ? (
+                          <p><span className="text-slate-400">Gelmeyen:</span> {row.absentTeacherName}</p>
+                          {mergedClassesFor(row).length > 0 && (
+                            <p className="text-xs font-medium text-orange-700 bg-orange-50 border border-orange-200 rounded px-2 py-1">
+                              Birleştirildi: görevli bu saatte {mergedClassesFor(row).join(', ')} sınıfına da giriyor
+                            </p>
+                          )}
+                          {options ? (
+                            <div className="flex items-center gap-2 pt-1">
+                              <label className="text-slate-400 flex-shrink-0" htmlFor={`sub-${row.key}`}>Görevli:</label>
+                              <select
+                                id={`sub-${row.key}`}
+                                value={sub?.substituteTeacherId ?? ''}
+                                onChange={(e) => setLessonSubstitute(e.target.value, row.absentTeacherId, row.hour, row.className)}
+                                className={`flex-1 min-w-0 border rounded-md px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+                                  isUnassigned ? 'border-amber-300 text-amber-800' : 'border-indigo-200 text-indigo-800 font-medium'
+                                }`}
+                              >
+                                <option value="">— Görevli yok —</option>
+                                {options.duty.length > 0 && (
+                                  <optgroup label="Bugünkü nöbetçiler">
+                                    {options.duty.map(t => (
+                                      <option key={t.id} value={t.id}>{formatOptionLabel(t)}</option>
+                                    ))}
+                                  </optgroup>
+                                )}
+                                {options.others.length > 0 && (
+                                  <optgroup label="Bu saatte boş diğer öğretmenler">
+                                    {options.others.map(t => (
+                                      <option key={t.id} value={t.id}>{formatOptionLabel(t)}</option>
+                                    ))}
+                                  </optgroup>
+                                )}
+                                {options.merge.length > 0 && (
+                                  <optgroup label="Sınıf birleştir (bu saatte başka sınıfta görevli)">
+                                    {options.merge.map(t => (
+                                      <option key={t.id} value={t.id}>{formatOptionLabel(t)}</option>
+                                    ))}
+                                  </optgroup>
+                                )}
+                              </select>
+                            </div>
+                          ) : isUnassigned ? (
                             <p className="flex items-center gap-1.5 text-amber-700 font-medium">
                               <AlertTriangle className="w-4 h-4" />
-                              Uygun nöbetçi bulunamadı
+                              Görevli atanmadı
                             </p>
                           ) : (
                             <div className="flex items-center justify-between">
@@ -895,6 +1314,71 @@ export default function DailyOperationsTab({
         </div>
       )}
 
+      {/* Tüm öğretmenlerin görevlendirme sayıları */}
+      <div className="bg-surface rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50 flex flex-col sm:flex-row sm:items-center gap-3">
+          <div className="flex items-center gap-2">
+            <Users className="w-5 h-5 text-indigo-600" />
+            <div>
+              <h3 className="font-semibold text-slate-800">Görevlendirme Sayıları</h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Bu eğitim yılında kimin kaç derse görevlendirildiği (elle yapılanlar dahil)
+              </p>
+            </div>
+          </div>
+          <input
+            type="search"
+            value={countSearch}
+            onChange={(e) => setCountSearch(e.target.value)}
+            placeholder="Öğretmen ara..."
+            className="sm:ml-auto border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-full sm:w-56"
+          />
+        </div>
+        <div className="max-h-[420px] overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-500 text-xs uppercase sticky top-0">
+              <tr>
+                <th className="text-left font-medium px-4 py-2 w-10">#</th>
+                <th className="text-left font-medium px-4 py-2">Öğretmen</th>
+                <th className="text-center font-medium px-4 py-2">Seçili gün</th>
+                <th className="text-center font-medium px-4 py-2">Bu ay</th>
+                <th className="text-center font-medium px-4 py-2">Toplam</th>
+                <th className="text-right font-medium px-4 py-2 hidden sm:table-cell">Son görev</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {teacherCountRows.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="text-center text-slate-500 py-6">Öğretmen bulunamadı.</td>
+                </tr>
+              ) : teacherCountRows.map((r, i) => (
+                <tr key={r.teacher.id} className={r.total === 0 ? 'text-slate-400' : 'text-slate-700'}>
+                  <td className="px-4 py-2">{i + 1}</td>
+                  <td className="px-4 py-2 font-medium">
+                    {r.teacher.name}
+                    {r.teacher.dutyType === 'nobetDisi' && (
+                      <span className="ml-1.5 text-[10px] font-normal text-slate-400">(nöbet dışı)</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2 text-center">{r.today || '-'}</td>
+                  <td className="px-4 py-2 text-center">{r.month || '-'}</td>
+                  <td className="px-4 py-2 text-center">
+                    <span className={`inline-block min-w-[2rem] px-2 py-0.5 rounded-full text-xs font-semibold ${
+                      r.total > 0 ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-400'
+                    }`}>
+                      {r.total}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2 text-right text-xs hidden sm:table-cell">
+                    {r.lastDate ? format(parseISO(r.lastDate), 'dd.MM.yyyy') : '-'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       {/* Geçici Nöbetçi Havuzu - Manuel Atama Modal */}
       {poolPickerTeacherId && (() => {
         const poolEntry = nonDutyFreeSuggestions.find(s => s.teacher.id === poolPickerTeacherId);
@@ -904,9 +1388,12 @@ export default function DailyOperationsTab({
         dailyAbsences.forEach(ab => {
           const absentTeacher = teachers.find(t => t.id === ab.teacherId);
           if (!absentTeacher?.schedule?.[dayOfWeek]) return;
+          const absentHours = ab.hours && ab.hours.length > 0 ? new Set(ab.hours) : null;
           Object.entries(absentTeacher.schedule[dayOfWeek]).forEach(([hourStr, className]) => {
             const hour = parseInt(hourStr, 10);
             if (!freeHourSet.has(hour)) return;
+            if (absentHours && !absentHours.has(hour)) return;
+            if (!className) return;
             const existing = substitutions.find(
               s => s.date === selectedDate && s.absentTeacherId === absentTeacher.id && s.hour === hour && s.className === className,
             );

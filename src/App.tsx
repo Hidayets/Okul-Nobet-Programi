@@ -1,7 +1,8 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Calendar, MapPin, Users, Settings, FileText, ClipboardList, BookOpen, LogOut, GraduationCap, ChevronDown, BarChart3, HelpCircle, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Fragment, useState, useEffect, useMemo, useCallback } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { cn } from './lib/utils';
-import { Teacher, Location, Assignment, Absence, Substitution, SchoolInfo, ClassInfo, Holiday, ScheduleArchive, getCurrentAcademicYear, formatAcademicYear } from './types';
+import AppShell, { AppTab } from './components/AppShell';
+import { Teacher, Location, Assignment, Absence, Substitution, SchoolInfo, ClassInfo, Holiday, ScheduleArchive, DutyChange, getCurrentAcademicYear, getRelevantAcademicYears, sortLocationsByOrder } from './types';
 import TeachersTab from './components/TeachersTab';
 import LocationsTab from './components/LocationsTab';
 import GeneratorTab from './components/GeneratorTab';
@@ -21,6 +22,11 @@ import { useAuth } from './AuthContext';
 import { useApiSync } from './hooks/useApiSync';
 import { useApiDoc } from './hooks/useApiDoc';
 import { unifyTeachers } from './lib/teacherMatching';
+import { getAuthHeaders } from './lib/apiHeaders';
+import { useMebCalendarSync, MebSyncOutcome } from './hooks/useMebCalendarSync';
+import { useUndoableUpdates } from './hooks/useUndoableUpdates';
+import { SYNC_ERROR_EVENT } from './lib/syncEvents';
+import { License } from './types';
 
 // Vite üzerinden enjekte edilen client sürümü (build sırasında define ile gelir).
 // vite.config.ts içinde ayrıca tanımlanmadıysa fallback değeri kullanılır.
@@ -30,14 +36,18 @@ const CLIENT_VERSION: string =
   (typeof window !== 'undefined' && (window as any).__APP_VERSION__) ||
   '';
 
-type Tab = 'teachers' | 'locations' | 'generator' | 'schedule' | 'daily' | 'absenceTracking' | 'settings' | 'schedules';
-
 export default function App() {
-  const { user, license, loading, signOut, licenseLockout } = useAuth();
+  const { user, license, loading, signOut, licenseLockout, actingKurumKodu, setActingKurumKodu } = useAuth();
   const [showRegister, setShowRegister] = useState(false);
-  const [activeTab, setActiveTab] = useState<Tab>('schedule');
+  const [activeTab, setActiveTab] = useState<AppTab>('schedule');
+  const [superAdminLicenses, setSuperAdminLicenses] = useState<License[]>([]);
   const [tourOpen, setTourOpen] = useState(false);
   const [showLicenseWarning, setShowLicenseWarning] = useState(false);
+  const [mebSyncNotice, setMebSyncNotice] = useState<MebSyncOutcome | null>(null);
+
+  const handleMebSync = useCallback((outcome: MebSyncOutcome | null) => {
+    if (outcome) setMebSyncNotice(outcome);
+  }, []);
 
   // Lisans pasifleştirildi/dolduğunda backend 403 + licenseStatus döner ve
   // AuthContext oturumu kapatır. Burada kullanıcıya tek seferlik bir uyarı
@@ -77,31 +87,72 @@ export default function App() {
   const [versionMismatch, setVersionMismatch] = useState<{ client: string; server: string } | null>(null);
 
   const [activeYear, setActiveYear] = useState<string>(() => {
-    return localStorage.getItem('activeAcademicYear') || getCurrentAcademicYear();
+    const current = getCurrentAcademicYear();
+    const stored = localStorage.getItem('activeAcademicYear');
+    // Yeni eğitim yılı (Ağustos+) başladıysa eski seçimi otomatik güncelle
+    if (!stored || stored < current) return current;
+    return stored;
   });
 
   useEffect(() => {
     localStorage.setItem('activeAcademicYear', activeYear);
   }, [activeYear]);
 
+  const isSuperAdmin = user?.role === 'superadmin';
+  const isAdmin = user?.role === 'admin' || isSuperAdmin;
+
   const scopedCollection = (name: string) => `${name}__${activeYear}`;
 
-  const [teachers, setTeachers] = useApiSync<Teacher>(scopedCollection('teachers'), []);
+  const [teachers, setTeachers, teachersLoaded] = useApiSync<Teacher>(scopedCollection('teachers'), []);
   const [classes, setClasses] = useApiSync<ClassInfo>(scopedCollection('classes'), []);
-  const [locations, setLocations] = useApiSync<Location>(scopedCollection('locations'), []);
-  const [assignments, setAssignments] = useApiSync<Assignment>(scopedCollection('assignments'), []);
+  const [locations, setLocations, locationsLoaded] = useApiSync<Location>(scopedCollection('locations'), []);
+  const orderedLocations = useMemo(() => sortLocationsByOrder(locations), [locations]);
+  const [assignments, setAssignments, assignmentsLoaded] = useApiSync<Assignment>(scopedCollection('assignments'), []);
+  const assignmentHistory = useUndoableUpdates(
+    assignments,
+    setAssignments,
+    `${activeYear}|${user?.uid ?? ''}|${actingKurumKodu ?? ''}`,
+  );
   const [absences, setAbsences] = useApiSync<Absence>(scopedCollection('absences'), []);
   const [substitutions, setSubstitutions] = useApiSync<Substitution>(scopedCollection('substitutions'), []);
-  const [holidays, setHolidays] = useApiSync<Holiday>(scopedCollection('holidays'), []);
+  const [holidays, setHolidays, holidaysLoaded] = useApiSync<Holiday>(scopedCollection('holidays'), []);
   const [scheduleArchives, setScheduleArchives] = useApiSync<ScheduleArchive>(scopedCollection('scheduleArchives'), []);
+  const [dutyChanges, setDutyChanges] = useApiSync<DutyChange>(scopedCollection('dutyChanges'), []);
 
-  const [schoolInfo, setSchoolInfo] = useApiDoc<SchoolInfo>('schoolInfo/info', {
+  const [schoolInfo, setSchoolInfo, schoolInfoLoaded] = useApiDoc<SchoolInfo>('schoolInfo/info', {
     valilik: '',
     kaymakamlik: '',
     okulAdi: '',
     okulMuduru: '',
     mudurYardimcilari: []
   });
+
+  // Güncel yılı okul dönem listesine ekle
+  useEffect(() => {
+    if (!schoolInfoLoaded || !isAdmin) return;
+    const current = getCurrentAcademicYear();
+    const years = schoolInfo.academicYears || [];
+    if (years.includes(current)) return;
+    setSchoolInfo(prev => {
+      const y = prev.academicYears || [];
+      if (y.includes(current)) return prev;
+      return { ...prev, academicYears: [...y, current].sort() };
+    });
+  }, [schoolInfoLoaded, isAdmin, schoolInfo.academicYears, setSchoolInfo]);
+
+  const [syncError, setSyncError] = useState<string | null>(null);
+  useEffect(() => {
+    const onError = (e: Event) => setSyncError((e as CustomEvent<string>).detail);
+    window.addEventListener(SYNC_ERROR_EVENT, onError);
+    return () => window.removeEventListener(SYNC_ERROR_EVENT, onError);
+  }, []);
+
+  // Rol değişince (çıkış / farklı kullanıcıyla giriş) yetkisiz sekmede kalınmasın.
+  useEffect(() => {
+    const adminOnlyTabs: AppTab[] = ['teachers', 'schedules', 'locations', 'generator', 'settings'];
+    if (!isAdmin && adminOnlyTabs.includes(activeTab)) setActiveTab('schedule');
+    if (!isSuperAdmin && activeTab === 'licenses') setActiveTab('schedule');
+  }, [isAdmin, isSuperAdmin, activeTab]);
 
   const handleTeacherIdsMerged = useCallback((idRemap: Record<string, string>) => {
     if (!idRemap || Object.keys(idRemap).length === 0) return;
@@ -119,6 +170,9 @@ export default function App() {
       prev.map((loc) => ({
         ...loc,
         duties: loc.duties.map((d) => ({ ...d, teacherId: mapId(d.teacherId) })),
+        assignedTeacherIds: loc.assignedTeacherIds
+          ? [...new Set(loc.assignedTeacherIds.map(mapId))]
+          : loc.assignedTeacherIds,
       })),
     );
     setScheduleArchives((prev) =>
@@ -127,11 +181,39 @@ export default function App() {
         assignments: arch.assignments.map((a) => ({ ...a, teacherId: mapId(a.teacherId) })),
       })),
     );
-  }, [setAssignments, setAbsences, setSubstitutions, setLocations, setScheduleArchives]);
+    assignmentHistory.clearHistory();
+  }, [setAssignments, setAbsences, setSubstitutions, setLocations, setScheduleArchives, assignmentHistory.clearHistory]);
+
+  const handleLocationsRemoved = useCallback((ids: string[]) => {
+    if (ids.length === 0) return;
+    const removed = new Set(ids);
+    setAssignments((prev) => prev.filter((a) => !removed.has(a.locationId)));
+    assignmentHistory.clearHistory();
+  }, [setAssignments, assignmentHistory.clearHistory]);
+
+  const handleTeachersRemoved = useCallback((ids: string[]) => {
+    if (ids.length === 0) return;
+    const removed = new Set(ids);
+    assignmentHistory.clearHistory();
+    setAssignments((prev) => prev.filter((a) => !removed.has(a.teacherId)));
+    setAbsences((prev) => prev.filter((a) => !removed.has(a.teacherId)));
+    setSubstitutions((prev) =>
+      prev
+        .filter((s) => !removed.has(s.absentTeacherId))
+        .map((s) => (s.substituteTeacherId && removed.has(s.substituteTeacherId) ? { ...s, substituteTeacherId: '' } : s)),
+    );
+    setLocations((prev) =>
+      prev.map((loc) => ({
+        ...loc,
+        duties: (loc.duties || []).filter((d) => !removed.has(d.teacherId)),
+        assignedTeacherIds: loc.assignedTeacherIds?.filter((id) => !removed.has(id)),
+      })),
+    );
+  }, [setAssignments, setAbsences, setSubstitutions, setLocations, assignmentHistory.clearHistory]);
 
   const availableYears = useMemo(() => {
     const years = new Set(schoolInfo.academicYears || []);
-    years.add(getCurrentAcademicYear());
+    for (const y of getRelevantAcademicYears()) years.add(y);
     return Array.from(years).sort();
   }, [schoolInfo.academicYears]);
 
@@ -155,7 +237,7 @@ export default function App() {
   // İşlem yalnızca gerçekten birleştirilecek kayıt varsa state'i günceller,
   // bu sayede sonsuz döngü oluşmaz.
   useEffect(() => {
-    if (!user || user.role === 'superadmin') return;
+    if (!user || user.role !== 'admin') return;
     if (!teachers || teachers.length < 2) return;
     const { teachers: unified, idRemap } = unifyTeachers(teachers);
     if (Object.keys(idRemap).length === 0) return;
@@ -201,8 +283,43 @@ export default function App() {
     setUpdateCheckTrigger((n) => n + 1);
   }, []);
 
-  const updateReady = updateStatus.status === 'downloaded';
-  const updateInProgress = updateStatus.status === 'available' || updateStatus.status === 'downloading';
+  useMebCalendarSync({
+    activeYear,
+    holidays,
+    setHolidays,
+    schoolInfo,
+    setSchoolInfo,
+    assignments,
+    setAssignments,
+    teachers,
+    locations: orderedLocations,
+    enabled: !!user && isAdmin && user.role !== 'superadmin' && holidaysLoaded && assignmentsLoaded && schoolInfoLoaded
+      && teachersLoaded && locationsLoaded,
+    onSync: handleMebSync,
+  });
+
+  useEffect(() => {
+    if (!isSuperAdmin) return;
+    (async () => {
+      try {
+        const res = await fetch('/api/licenses', { headers: getAuthHeaders() });
+        if (res.ok) setSuperAdminLicenses(await res.json());
+      } catch {}
+    })();
+  }, [isSuperAdmin]);
+
+  const handleSuperAdminSelectKurum = useCallback((kurumKodu: string) => {
+    setActingKurumKodu(kurumKodu);
+    setActiveTab('schedule');
+  }, [setActingKurumKodu]);
+
+  const yearLabels = useMemo(() => {
+    const labels: Record<string, string | undefined> = {};
+    for (const y of availableYears) {
+      labels[y] = schoolInfo.mebCalendarSync?.[y]?.title;
+    }
+    return labels;
+  }, [availableYears, schoolInfo.mebCalendarSync]);
 
   if (loading) {
     return (
@@ -219,158 +336,16 @@ export default function App() {
     return <Login onSwitchToRegister={() => setShowRegister(true)} />;
   }
 
-  // Özel yönetim paneli
-  if (user.role === 'superadmin') {
-    return <SuperAdminPanel onLogout={signOut} />;
-  }
-
-  const isAdmin = user.role === 'admin';
-
-  // Filter tabs based on role
-  const allTabs = [
-    { id: 'teachers', label: 'Öğretmenler', icon: Users, adminOnly: true },
-    { id: 'schedules', label: 'Ders Programları', icon: BookOpen, adminOnly: true },
-    { id: 'locations', label: 'Nöbet Yerleri', icon: MapPin, adminOnly: true },
-    { id: 'generator', label: 'Program Oluştur', icon: Settings, adminOnly: true },
-    { id: 'schedule', label: 'Nöbet Çizelgesi', icon: Calendar, adminOnly: false },
-    { id: 'daily', label: 'Günlük İşlemler', icon: ClipboardList, adminOnly: false },
-    { id: 'absenceTracking', label: 'Devamsızlık Takip', icon: BarChart3, adminOnly: false },
-    { id: 'settings', label: 'Ayarlar', icon: Settings, adminOnly: true },
-  ] as const;
-
-  const visibleTabs = allTabs.filter(tab => !tab.adminOnly || isAdmin);
-
-  // If current tab is not visible, switch to first visible
-  if (!visibleTabs.find(t => t.id === activeTab)) {
-    setActiveTab(visibleTabs[0].id as Tab);
-  }
-
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
-      <header className="bg-surface border-b border-slate-200 sticky top-0 z-30 print:hidden">
-        <div className="w-full max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <div className="flex items-center gap-2">
-              <div className="bg-indigo-600 p-2 rounded-lg text-white">
-                <FileText className="w-5 h-5" />
-              </div>
-              <h1 className="text-xl font-semibold tracking-tight text-slate-900 hidden sm:block">
-                Okul Nöbet Programı
-              </h1>
-              <div className="relative ml-1 sm:ml-3">
-                <select
-                  value={activeYear}
-                  onChange={(e) => setActiveYear(e.target.value)}
-                  className="appearance-none bg-indigo-50 text-indigo-700 text-sm font-semibold pl-8 pr-8 py-1.5 rounded-lg border border-indigo-200 hover:border-indigo-300 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 cursor-pointer transition-colors"
-                >
-                  {availableYears.map(y => (
-                    <option key={y} value={y}>{formatAcademicYear(y)}</option>
-                  ))}
-                </select>
-                <GraduationCap className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-indigo-500 pointer-events-none" />
-                <ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-indigo-400 pointer-events-none" />
-              </div>
-            </div>
-            <div className="flex items-center gap-3">
-              <div className="text-sm text-slate-500 hidden sm:block">
-                Kurum: <span className="font-semibold text-slate-700">{user.kurumKodu}</span>
-                <span className="mx-2">•</span>
-                Rol: <span className="font-semibold text-slate-700">{isAdmin ? 'Admin' : 'Öğretmen'}</span>
-              </div>
-
-              {/* Sürüm rozeti + güncelleme kontrol butonu */}
-              {appVersion && (
-                <button
-                  onClick={handleCheckUpdate}
-                  className={cn(
-                    "hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border transition-colors",
-                    updateReady
-                      ? "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
-                      : updateInProgress
-                      ? "bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100"
-                      : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
-                  )}
-                  title={updateReady ? "Güncelleme hazır - tıklayın" : "Güncellemeleri kontrol et"}
-                >
-                  <RefreshCw className={cn("w-3 h-3", updateStatus.status === 'checking' && "animate-spin")} />
-                  v{appVersion}
-                  {updateReady && (
-                    <span className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                  )}
-                </button>
-              )}
-
-              <button
-                onClick={() => setTourOpen(true)}
-                className="relative text-slate-500 hover:text-indigo-600 p-1.5 rounded-md hover:bg-slate-100 transition-colors"
-                title="Tanıtım turunu yeniden aç"
-              >
-                <HelpCircle className="w-5 h-5" />
-                {updateReady && (
-                  <span className="absolute top-0.5 right-0.5 inline-block w-2 h-2 rounded-full bg-emerald-500 ring-2 ring-white"></span>
-                )}
-              </button>
-              <button
-                onClick={signOut}
-                className="text-slate-500 hover:text-red-600 flex items-center gap-1 text-sm font-medium transition-colors"
-              >
-                <LogOut className="w-4 h-4" />
-                Çıkış
-              </button>
-            </div>
-          </div>
-          <nav className="flex space-x-8 overflow-x-auto" aria-label="Tabs">
-            {visibleTabs.map((tab) => {
-              const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id as Tab)}
-                  className={cn(
-                    "flex items-center gap-2 py-4 px-1 border-b-2 text-sm font-medium whitespace-nowrap transition-colors",
-                    isActive
-                      ? "border-indigo-600 text-indigo-600"
-                      : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"
-                  )}
-                >
-                  <Icon className="w-4 h-4" />
-                  {tab.label}
-                </button>
-              );
-            })}
-          </nav>
-        </div>
-      </header>
-
-      {versionMismatch && (
-        <div className="bg-amber-50 border-b border-amber-200 print:hidden">
-          <div className="w-full max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-2.5 flex items-start sm:items-center gap-2 text-sm text-amber-900">
-            <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 sm:mt-0 flex-shrink-0" />
-            <div className="flex-1">
-              <span className="font-semibold">Sürüm uyumsuzluğu:</span>{' '}
-              Bu bilgisayardaki uygulama <span className="font-mono font-semibold">v{versionMismatch.client}</span>,
-              ana sunucudaki sürüm ise <span className="font-mono font-semibold">v{versionMismatch.server}</span>.
-              {' '}Sorun yaşamamak için her iki bilgisayarın da güncellenmesi önerilir.
-            </div>
-            <button
-              onClick={() => setVersionMismatch(null)}
-              className="text-amber-700 hover:text-amber-900 text-xs font-medium px-2 py-1 rounded hover:bg-amber-100"
-            >
-              Gizle
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Lisans süresi bandı: kullanıcı modal'ı kapatsa bile hatırlatsın */}
+  const banners = (
+    <>
+      {/* Sürüm uyumsuzluğu uyarısı kaldırıldı */}
       {user && user.role !== 'superadmin' && license && license.expiresAt && license.daysRemaining !== null && license.daysRemaining <= 30 && (
         <div className={cn(
           "border-b print:hidden",
           license.daysRemaining < 0 ? "bg-red-50 border-red-200" : "bg-amber-50 border-amber-200"
         )}>
           <div className={cn(
-            "w-full max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex items-center gap-2 text-sm",
+            "px-4 sm:px-6 py-2 flex items-center gap-2 text-sm",
             license.daysRemaining < 0 ? "text-red-900" : "text-amber-900"
           )}>
             <AlertTriangle className={cn(
@@ -381,16 +356,12 @@ export default function App() {
               {license.daysRemaining < 0 ? (
                 <>
                   <span className="font-semibold">{formatLicenseDateLongTr(license.expiresAt)} tarihinde lisans süreniz dolmuştur.</span>{' '}
-                  Lütfen{' '}
-                  <a href="mailto:okulcozumleri@gmail.com" className="font-semibold underline">okulcozumleri@gmail.com</a>{' '}
-                  adresiyle iletişime geçiniz.
+                  <a href="mailto:okulcozumleri@gmail.com" className="font-semibold underline">okulcozumleri@gmail.com</a>
                 </>
               ) : (
                 <>
                   <span className="font-semibold">{formatLicenseDateLongTr(license.expiresAt)} tarihinde lisans süreniz dolacaktır.</span>{' '}
-                  Lütfen{' '}
-                  <a href="mailto:okulcozumleri@gmail.com" className="font-semibold underline">okulcozumleri@gmail.com</a>{' '}
-                  adresiyle iletişime geçiniz.
+                  <a href="mailto:okulcozumleri@gmail.com" className="font-semibold underline">okulcozumleri@gmail.com</a>
                 </>
               )}
             </div>
@@ -407,9 +378,72 @@ export default function App() {
         </div>
       )}
 
-      <main className="w-full max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-8 print:px-0 print:py-0 print:max-w-none">
+      {syncError && (
+        <div className="px-4 sm:px-6 py-2.5 border-b text-sm flex items-start justify-between gap-3 print:hidden bg-red-50 border-red-200 text-red-800">
+          <span>
+            <span className="font-semibold">Kaydetme hatası:</span> {syncError} Sayfayı yenileyip değişikliklerinizi kontrol edin.
+          </span>
+          <button
+            type="button"
+            onClick={() => setSyncError(null)}
+            className="text-xs font-medium opacity-70 hover:opacity-100 shrink-0"
+          >
+            Kapat
+          </button>
+        </div>
+      )}
+
+      {mebSyncNotice && (
+        <div className={`px-4 sm:px-6 py-2.5 border-b text-sm flex items-start justify-between gap-3 print:hidden ${
+          mebSyncNotice.type === 'success'
+            ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+            : mebSyncNotice.type === 'warning'
+              ? 'bg-amber-50 border-amber-200 text-amber-800'
+              : 'bg-sky-50 border-sky-200 text-sky-800'
+        }`}>
+          <span>{mebSyncNotice.message}</span>
+          <button
+            type="button"
+            onClick={() => setMebSyncNotice(null)}
+            className="text-xs font-medium opacity-70 hover:opacity-100 shrink-0"
+          >
+            Kapat
+          </button>
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <>
+    <AppShell
+      activeTab={activeTab}
+      onTabChange={setActiveTab}
+      isAdmin={isAdmin}
+      isSuperAdmin={isSuperAdmin}
+      user={user}
+      onSignOut={signOut}
+      onTourOpen={() => setTourOpen(true)}
+      onCheckUpdate={handleCheckUpdate}
+      appVersion={appVersion}
+      updateStatus={updateStatus}
+      activeYear={activeYear}
+      onYearChange={setActiveYear}
+      availableYears={availableYears}
+      yearLabels={yearLabels}
+      actingKurumKodu={actingKurumKodu}
+      onActingKurumChange={setActingKurumKodu}
+      superAdminOptions={superAdminLicenses.map(l => ({ kurumKodu: l.kurumKodu, okulAdi: l.okulAdi }))}
+      banners={banners}
+    >
+        {activeTab === 'licenses' && isSuperAdmin && (
+          <SuperAdminPanel
+            embedded
+            onSelectKurum={handleSuperAdminSelectKurum}
+          />
+        )}
         {activeTab === 'teachers' && isAdmin && (
-          <TeachersTab teachers={teachers} setTeachers={setTeachers} />
+          <TeachersTab teachers={teachers} setTeachers={setTeachers} onTeachersRemoved={handleTeachersRemoved} />
         )}
         {activeTab === 'schedules' && isAdmin && (
           <SchedulesTab 
@@ -419,17 +453,24 @@ export default function App() {
             classes={classes}
             setClasses={setClasses}
             schoolInfo={schoolInfo}
+            setSchoolInfo={setSchoolInfo}
           />
         )}
         {activeTab === 'locations' && isAdmin && (
-          <LocationsTab locations={locations} setLocations={setLocations} teachers={teachers} />
+          <LocationsTab
+            locations={locations}
+            setLocations={setLocations}
+            onLocationsRemoved={handleLocationsRemoved}
+            teachers={teachers}
+            schoolDayCount={schoolInfo.settings?.schoolDays?.length}
+          />
         )}
         {activeTab === 'generator' && isAdmin && (
           <GeneratorTab 
             teachers={teachers} 
-            locations={locations}
+            locations={orderedLocations}
             holidays={holidays}
-            onGenerate={(newAssignments) => {
+            onGenerate={async (newAssignments) => {
               if (assignments.length > 0) {
                 const sortedDates = assignments.map(a => a.date).sort();
                 const archiveStart = sortedDates[0];
@@ -445,39 +486,57 @@ export default function App() {
                   endDate: archiveEnd,
                   assignments: [...assignments],
                   archivedAt: new Date().toISOString(),
+                  mudurYardimcilari: schoolInfo.mudurYardimcilari.map(vp => ({ ...vp })),
                 };
-                setScheduleArchives(prev => [...prev, archive]);
+                const archived = await setScheduleArchives(prev => [...prev, archive]);
+                if (!archived) {
+                  alert('Önceki nöbet çizelgesi arşivlenemediği için yeni çizelge kaydedilmedi. Mevcut çizelgeniz korunuyor.');
+                  return;
+                }
               }
-              setAssignments(newAssignments);
+              assignmentHistory.update(newAssignments);
             }} 
             onSuccess={() => setActiveTab('schedule')}
             schoolInfo={schoolInfo}
+            currentAssignments={assignments}
+            scheduleArchives={scheduleArchives}
           />
         )}
         {activeTab === 'schedule' && (
           <ScheduleTab
             assignments={assignments}
-            setAssignments={setAssignments}
+            setAssignments={assignmentHistory.update}
             teachers={teachers}
-            locations={locations}
+            locations={orderedLocations}
             schoolInfo={schoolInfo}
+            holidays={holidays}
+            absences={absences}
+            substitutions={substitutions}
+            kurumKodu={actingKurumKodu || user.kurumKodu}
+            canUndo={assignmentHistory.canUndo}
+            onUndo={assignmentHistory.undo}
+            dutyChanges={dutyChanges}
+            setDutyChanges={setDutyChanges}
+            editorLabel={isSuperAdmin ? 'Yönetici' : 'Admin'}
             isAdmin={isAdmin}
             activeYear={activeYear}
             scheduleArchives={scheduleArchives}
             setScheduleArchives={setScheduleArchives}
+            onGoToGenerator={isAdmin ? () => setActiveTab('generator') : undefined}
           />
         )}
         {activeTab === 'daily' && (
           <DailyOperationsTab
             teachers={teachers}
             assignments={assignments}
-            setAssignments={setAssignments}
+            setAssignments={assignmentHistory.update}
             absences={absences}
             setAbsences={setAbsences}
             substitutions={substitutions}
             setSubstitutions={setSubstitutions}
             isAdmin={isAdmin}
             schoolInfo={schoolInfo}
+            locations={orderedLocations}
           />
         )}
         {activeTab === 'absenceTracking' && (
@@ -489,41 +548,41 @@ export default function App() {
           />
         )}
         {activeTab === 'settings' && isAdmin && (
-          <SettingsTab
-            schoolInfo={schoolInfo}
-            setSchoolInfo={setSchoolInfo}
-            holidays={holidays}
-            setHolidays={setHolidays}
-            activeYear={activeYear}
-          />
+          <Fragment key={`${actingKurumKodu ?? ''}|${activeYear}`}>
+            <SettingsTab
+              schoolInfo={schoolInfo}
+              setSchoolInfo={setSchoolInfo}
+              teachers={teachers}
+              locations={orderedLocations}
+              holidays={holidays}
+              setHolidays={setHolidays}
+              assignments={assignments}
+              setAssignments={assignmentHistory.update}
+              activeYear={activeYear}
+              isAdmin={isAdmin}
+            />
+          </Fragment>
         )}
-      </main>
+    </AppShell>
 
-      <footer className="w-full max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-4 text-center text-xs text-slate-400 print:hidden select-none">
-        © {new Date().getFullYear()} Hidayet SEVDİ
-      </footer>
+    <OnboardingTour
+      open={tourOpen}
+      onClose={() => setTourOpen(false)}
+      onTabChange={(tabId) => setActiveTab(tabId as AppTab)}
+    />
 
-      <OnboardingTour
-        open={tourOpen}
-        onClose={() => setTourOpen(false)}
-        onTabChange={(tabId) => {
-          const tab = visibleTabs.find(t => t.id === tabId);
-          if (tab) setActiveTab(tab.id as Tab);
-        }}
+    <UpdateNotifier
+      manualCheckTrigger={updateCheckTrigger}
+      onStatusChange={setUpdateStatus}
+    />
+
+    {showLicenseWarning && (
+      <LicenseExpiryWarning
+        license={license}
+        thresholdDays={30}
+        onDismiss={() => setShowLicenseWarning(false)}
       />
-
-      <UpdateNotifier
-        manualCheckTrigger={updateCheckTrigger}
-        onStatusChange={setUpdateStatus}
-      />
-
-      {showLicenseWarning && (
-        <LicenseExpiryWarning
-          license={license}
-          thresholdDays={30}
-          onDismiss={() => setShowLicenseWarning(false)}
-        />
-      )}
-    </div>
+    )}
+    </>
   );
 }

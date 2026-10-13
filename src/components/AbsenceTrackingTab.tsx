@@ -1,7 +1,8 @@
-import { useState, useMemo, useEffect } from 'react';
+import { Fragment, useState, useMemo } from 'react';
 import { format, parseISO } from 'date-fns';
 import { tr } from 'date-fns/locale';
 import { BarChart3, Printer, UserX } from 'lucide-react';
+import PrintPreview, { capturePrintHtml } from './PrintPreview';
 import { Teacher, Absence, SchoolInfo, ABSENCE_REASONS, AbsenceReason, formatAcademicYear } from '../types';
 
 interface Props {
@@ -23,7 +24,7 @@ interface TeacherAbsenceSummary {
 }
 
 export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, activeYear }: Props) {
-  const [isPrinting, setIsPrinting] = useState(false);
+  const [previewHtml, setPreviewHtml] = useState<string | null>(null);
   const [expandedTeacher, setExpandedTeacher] = useState<string | null>(null);
 
   const summaryData = useMemo(() => {
@@ -71,29 +72,17 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
     );
   }, [summaryData]);
 
-  const handlePrint = () => setIsPrinting(true);
+  const handlePrint = () => {
+    const html = capturePrintHtml('.absence-print-section');
+    if (html) setPreviewHtml(html);
+  };
 
-  useEffect(() => {
-    if (isPrinting) {
-      const timer = setTimeout(() => {
-        if ((window as any).electronAPI?.print) {
-          (window as any).electronAPI.print();
-        } else {
-          window.print();
-        }
-        setIsPrinting(false);
-      }, 150);
-      return () => clearTimeout(timer);
-    }
-  }, [isPrinting]);
-
-  const yearLabel = formatAcademicYear(activeYear);
+  const yearLabel = formatAcademicYear(activeYear, schoolInfo?.mebCalendarSync?.[activeYear]?.title);
   const okulAdi = schoolInfo.okulAdi || '';
 
   return (
     <div className="space-y-6 absence-tracking-container">
-      {isPrinting && (
-        <style type="text/css" media="print">
+      <style type="text/css" media="print">
           {`
             @page { size: portrait; margin: 1.5cm; }
             .absence-tracking-container > *:not(.absence-print-section):not(style) { display: none !important; }
@@ -103,11 +92,19 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
             .absence-print-section th, .absence-print-section td { border: 1.5px solid #334155 !important; padding: 6px 10px !important; font-size: 11px !important; }
             .absence-print-section th { background-color: #f1f5f9 !important; font-weight: 700 !important; text-align: center !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
           `}
-        </style>
+      </style>
+
+      {previewHtml && (
+        <PrintPreview
+          title="Devamsızlık takip çizelgesi"
+          html={previewHtml}
+          page="portrait"
+          onClose={() => setPreviewHtml(null)}
+        />
       )}
 
       {/* Print section */}
-      <div className="absence-print-section" style={{ display: isPrinting ? 'block' : 'none' }}>
+      <div className="absence-print-section" style={{ display: 'none' }}>
         <div style={{ textAlign: 'center', marginBottom: '20px' }}>
           {okulAdi && <div style={{ fontSize: '15px', fontWeight: 700, marginBottom: '4px' }}>{okulAdi}</div>}
           <div style={{ fontSize: '14px', fontWeight: 600, marginBottom: '4px' }}>ÖĞRETMEN DEVAMSIZLIK TAKİP ÇİZELGESİ</div>
@@ -216,9 +213,8 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {summaryData.map((item, i) => (
-                  <>
+                  <Fragment key={item.teacher.id}>
                     <tr
-                      key={item.teacher.id}
                       className="hover:bg-slate-50/50 transition-colors cursor-pointer"
                       onClick={() => setExpandedTeacher(expandedTeacher === item.teacher.id ? null : item.teacher.id)}
                     >
@@ -237,10 +233,10 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
                       <td className="py-3 px-4 text-center text-sm">{item.diger || <span className="text-slate-300">-</span>}</td>
                     </tr>
                     {expandedTeacher === item.teacher.id && (
-                      <tr key={`${item.teacher.id}-detail`}>
+                      <tr>
                         <td colSpan={3 + ABSENCE_REASONS.length} className="px-4 py-3 bg-slate-50/80">
                           <div className="flex flex-wrap gap-2">
-                            {item.details
+                            {[...item.details]
                               .sort((a, b) => a.date.localeCompare(b.date))
                               .map((d, di) => {
                                 const reason = d.reason ? ABSENCE_REASONS.find(r => r.id === d.reason) : null;
@@ -259,7 +255,7 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
                         </td>
                       </tr>
                     )}
-                  </>
+                  </Fragment>
                 ))}
                 <tr className="bg-slate-50 font-semibold border-t-2 border-slate-300">
                   <td colSpan={2} className="py-3 px-4 text-sm text-slate-700 text-right">TOPLAM</td>

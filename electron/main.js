@@ -1,17 +1,36 @@
 import { app, BrowserWindow, shell, ipcMain, dialog } from 'electron';
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
+const require = createRequire(import.meta.url);
 
 // Uygulama ismini açıkça sabitle. Aksi halde Electron app.getName() çağrısı
 // package.json'daki "name" alanına bakar; bu da bundle sürecine göre değişebilir.
 // Sabitleyince app.getPath('userData') her sürümde aynı klasörü döndürür.
 // → %APPDATA%/okul-nobet-programi
 app.setName('okul-nobet-programi');
+
+// Aynı anda tek kopya: ikinci açılış kendini kapatır, açık pencere öne gelir.
+// Kilit userData klasörüne bağlı olduğundan setName'den sonra alınmalı.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const win = mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow
+      : BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  });
+}
 
 // Native dialog'u kapatmak için flag - frontend kendi UI'sını gösterir
 const USE_NATIVE_UPDATE_DIALOG = false;
@@ -24,8 +43,34 @@ const PORT    = 3000;
 
 let mainWindow   = null;
 let serverProcess = null;
+let serverStartError = '';
+let serverExited = false;
+let serverLogPath = '';
 let appMode = null; // 'server' | 'client'
-let serverUrl = `http://localhost:${PORT}`;
+let serverUrl = `http://127.0.0.1:${PORT}`;
+
+// Ortak bulut sunucusu: package.json > okulNobet.cloudUrl (ya da OKUL_NOBET_CLOUD_URL).
+// Tanımlıysa tüm kurulumlar buraya bağlanır; böylece lisanslar ve kurum verileri her bilgisayarda aynıdır.
+function readCloudUrl() {
+  const fromEnv = String(process.env.OKUL_NOBET_CLOUD_URL || '').trim();
+  if (fromEnv) return fromEnv.replace(/\/+$/, '');
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(app.getAppPath(), 'package.json'), 'utf-8'));
+    const url = String(pkg?.okulNobet?.cloudUrl || '').trim();
+    return url ? url.replace(/\/+$/, '') : '';
+  } catch {
+    return '';
+  }
+}
+
+// "192.168.1.5", "192.168.1.5:3000" ya da "https://okul.ornek.com" kabul edilir.
+function resolveServerUrl(input) {
+  const raw = String(input || '').trim().replace(/\/+$/, '');
+  if (!raw) return `http://localhost:${PORT}`;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.includes(':')) return `http://${raw}`;
+  return `http://${raw}:${PORT}`;
+}
 
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
@@ -148,6 +193,22 @@ ipcMain.handle('updater:install', async () => {
   }
 });
 
+// Dosya sistemine dokunan IPC'ler yalnızca uygulamanın kendi sayfasından çağrılabilir.
+// Sunucu http→https yönlendirmesi yapabileceği için şema değil, ana bilgisayar adı karşılaştırılır.
+function isTrustedSender(evt) {
+  try {
+    if (!mainWindow || evt?.sender !== mainWindow.webContents) return false;
+    if (evt.senderFrame !== evt.sender.mainFrame) return false;
+    const frame = new URL(evt.senderFrame.url);
+    const appUrl = new URL(serverUrl);
+    return /^https?:$/.test(frame.protocol) && frame.hostname === appUrl.hostname;
+  } catch {
+    return false;
+  }
+}
+
+const UNTRUSTED = { ok: false, error: 'Bu işleme izin verilmiyor.' };
+
 // ───── Yedekleme IPC'leri ─────
 ipcMain.handle('backup:create', async () => {
   return backupDatabase('manual');
@@ -173,11 +234,14 @@ ipcMain.handle('backup:get-paths', async () => {
     backupDir: BACKUP_DIR,
     dbExists: fs.existsSync(DB_FILE),
     externalDir: getExternalBackupDir(),
+    canRestore: appMode === 'server',
+    isCloud: appMode === 'cloud',
   };
 });
 
 // Ek yedek konumunu kullanıcıya seçtir (OneDrive/Drive/USB klasörü gibi)
-ipcMain.handle('backup:pick-external-dir', async () => {
+ipcMain.handle('backup:pick-external-dir', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   try {
     const result = await dialog.showOpenDialog(mainWindow || undefined, {
       title: 'Ek yedek klasörü seçin (OneDrive/Drive klasörü önerilir)',
@@ -205,7 +269,8 @@ ipcMain.handle('backup:pick-external-dir', async () => {
   }
 });
 
-ipcMain.handle('backup:clear-external-dir', async () => {
+ipcMain.handle('backup:clear-external-dir', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   try {
     const settings = loadBackupSettings();
     delete settings.externalDir;
@@ -218,13 +283,20 @@ ipcMain.handle('backup:clear-external-dir', async () => {
 
 // "Yedeği indir": mevcut DB'nin (veya seçilen yedeğin) kopyasını kullanıcının
 // belirlediği konuma kaydeder. USB/Drive/manual transfer için.
-ipcMain.handle('backup:download', async (_evt, sourcePath) => {
+ipcMain.handle('backup:download', async (evt, sourcePath) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   try {
-    const src = (typeof sourcePath === 'string' && sourcePath) ? sourcePath : DB_FILE;
+    const src = (typeof sourcePath === 'string' && sourcePath) ? path.resolve(sourcePath) : DB_FILE;
+    if (src !== path.resolve(DB_FILE) && !isAllowedBackupPath(src)) {
+      return { ok: false, error: 'Yalnızca veritabanı ve yedek klasöründeki dosyalar indirilebilir.' };
+    }
     if (!fs.existsSync(src)) {
       return { ok: false, error: 'Kaynak dosya bulunamadı.' };
     }
-    const ts = new Date().toISOString().split('T')[0];
+    if (!isSqliteFile(src)) {
+      return { ok: false, error: 'Seçilen dosya geçerli bir SQLite veritabanı değil.' };
+    }
+    const ts = localDateStr();
     const defaultName = path.basename(src).startsWith('database-')
       ? path.basename(src)
       : `okul-nobet-yedek-${ts}.sqlite`;
@@ -239,9 +311,151 @@ ipcMain.handle('backup:download', async (_evt, sourcePath) => {
     if (result.canceled || !result.filePath) {
       return { ok: false, canceled: true };
     }
-    fs.copyFileSync(src, result.filePath);
+    copyDatabaseWithWal(src, result.filePath);
     return { ok: true, path: result.filePath };
   } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
+function isAllowedBackupPath(filePath) {
+  const normalized = path.resolve(filePath);
+  const roots = [path.resolve(BACKUP_DIR)];
+  const extDir = getExternalBackupDir();
+  if (extDir) roots.push(path.resolve(extDir));
+  return roots.some((root) => normalized === root || normalized.startsWith(root + path.sep));
+}
+
+function isSqliteFile(filePath) {
+  try {
+    const header = Buffer.alloc(16);
+    const fd = fs.openSync(filePath, 'r');
+    fs.readSync(fd, header, 0, 16, 0);
+    fs.closeSync(fd);
+    return header.toString('utf8', 0, 15) === 'SQLite format 3';
+  } catch {
+    return false;
+  }
+}
+
+function stopServer() {
+  if (serverProcess) {
+    serverProcess.kill();
+    serverProcess = null;
+  }
+}
+
+/** Sunucuyu durdurur ve süreç gerçekten kapanana kadar (en fazla timeoutMs) bekler. */
+function stopServerAndWait(timeoutMs = 5000) {
+  const proc = serverProcess;
+  stopServer();
+  if (!proc || proc.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    proc.once('exit', () => { clearTimeout(timer); resolve(); });
+  });
+}
+
+function removeIfExists(filePath) {
+  try { fs.unlinkSync(filePath); } catch {}
+}
+
+// Sunucu SQLite'ı WAL kipinde açar; son değişiklikler "-wal" dosyasında durur.
+// WAL önce, ana dosya sonra kopyalanır: arada checkpoint olursa ana dosya zaten
+// o sayfaları içerdiğinden eski WAL'ın yeniden uygulanması tutarlı sonuç verir.
+function copyDatabaseWithWal(src, dest) {
+  const srcWal = `${src}-wal`;
+  const hasWal = fs.existsSync(srcWal) && fs.statSync(srcWal).size > 0;
+  if (hasWal) fs.copyFileSync(srcWal, `${dest}-wal`);
+  fs.copyFileSync(src, dest);
+  if (!hasWal) removeIfExists(`${dest}-wal`);
+  removeIfExists(`${dest}-shm`);
+}
+
+function removeBackupFile(filePath) {
+  removeIfExists(filePath);
+  removeIfExists(`${filePath}-wal`);
+}
+
+ipcMain.handle('backup:restore', async (evt, backupPath) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
+  try {
+    if (appMode !== 'server') {
+      return { ok: false, error: 'Geri yükleme yalnızca sunucu (ana bilgisayar) modunda kullanılabilir.' };
+    }
+    const src = typeof backupPath === 'string' ? backupPath.trim() : '';
+    if (!src || !fs.existsSync(src)) {
+      return { ok: false, error: 'Yedek dosyası bulunamadı.' };
+    }
+    if (!isAllowedBackupPath(src)) {
+      return { ok: false, error: 'Yalnızca uygulama yedek klasöründeki dosyalar geri yüklenebilir.' };
+    }
+    if (!isSqliteFile(src)) {
+      return { ok: false, error: 'Seçilen dosya geçerli bir SQLite veritabanı değil.' };
+    }
+
+    if (fs.existsSync(DB_FILE)) {
+      const safety = backupDatabase('pre-restore');
+      if (!safety.ok) {
+        return { ok: false, error: `Geri yükleme öncesi güvenlik yedeği alınamadı: ${safety.error}` };
+      }
+    }
+
+    await stopServerAndWait();
+
+    copyDatabaseWithWal(src, DB_FILE);
+
+    app.relaunch();
+    app.quit();
+    return { ok: true, restarting: true };
+  } catch (err) {
+    if (appMode === 'server' && !isDev) {
+      try { startServer(); } catch {}
+    }
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle('backup:pick-and-restore', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
+  try {
+    if (appMode !== 'server') {
+      return { ok: false, error: 'Geri yükleme yalnızca sunucu (ana bilgisayar) modunda kullanılabilir.' };
+    }
+    const result = await dialog.showOpenDialog(mainWindow || undefined, {
+      title: 'Geri yüklenecek yedek dosyasını seçin',
+      properties: ['openFile'],
+      filters: [
+        { name: 'SQLite Veritabanı', extensions: ['sqlite'] },
+        { name: 'Tüm dosyalar', extensions: ['*'] },
+      ],
+    });
+    if (result.canceled || !result.filePaths?.[0]) {
+      return { ok: false, canceled: true };
+    }
+    const src = result.filePaths[0];
+    if (!isSqliteFile(src)) {
+      return { ok: false, error: 'Seçilen dosya geçerli bir SQLite veritabanı değil.' };
+    }
+
+    if (fs.existsSync(DB_FILE)) {
+      const safety = backupDatabase('pre-restore');
+      if (!safety.ok) {
+        return { ok: false, error: `Geri yükleme öncesi güvenlik yedeği alınamadı: ${safety.error}` };
+      }
+    }
+
+    await stopServerAndWait();
+
+    copyDatabaseWithWal(src, DB_FILE);
+
+    app.relaunch();
+    app.quit();
+    return { ok: true, restarting: true, path: src };
+  } catch (err) {
+    if (appMode === 'server' && !isDev) {
+      try { startServer(); } catch {}
+    }
     return { ok: false, error: err?.message || String(err) };
   }
 });
@@ -318,32 +532,87 @@ function getIconPath() {
   return path.join(process.resourcesPath, 'icon.ico');
 }
 
+function healthUrlFor(url) {
+  const base = String(url || '').replace(/\/+$/, '');
+  if (base.endsWith('/api/health')) return base;
+  return `${base}/api/health`;
+}
+
+function readServerLogTail(max = 900) {
+  try {
+    if (!serverLogPath || !fs.existsSync(serverLogPath)) return '';
+    const text = fs.readFileSync(serverLogPath, 'utf8').trim();
+    return text.length > max ? text.slice(-max) : text;
+  } catch {
+    return '';
+  }
+}
+
+function killStaleServer() {
+  if (process.platform !== 'win32') return Promise.resolve();
+  return new Promise((resolve) => {
+    execFile('taskkill', ['/IM', 'OkulNobet.exe', '/F'], { windowsHide: true }, () => resolve());
+  });
+}
+
 async function waitForServer(url, maxMs = 20000) {
+  const healthUrl = healthUrlFor(url);
   const start = Date.now();
   while (Date.now() - start < maxMs) {
+    if (serverStartError || serverExited) return false;
     try {
-      const res = await fetch(url);
-      if (res.ok || res.status < 500) return true;
+      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(1500) });
+      if (res.ok || (res.status > 0 && res.status < 500)) return true;
     } catch { /* henüz hazır değil */ }
     await new Promise(r => setTimeout(r, 300));
   }
   return false;
 }
 
-function startServer() {
+async function startServer() {
   if (isDev) return;
+  serverStartError = '';
+  serverExited = false;
   const exeDir = path.dirname(app.getPath('exe'));
   const serverExe = path.join(exeDir, 'OkulNobet.exe');
+  if (!fs.existsSync(serverExe)) {
+    serverStartError = `Sunucu dosyası bulunamadı:\n${serverExe}`;
+    return;
+  }
+
+  await killStaleServer();
+  await new Promise(r => setTimeout(r, 400));
+
+  const logDir = path.join(os.homedir(), 'AppData', 'Local', 'OkulNobetProgrami');
+  try { fs.mkdirSync(logDir, { recursive: true }); } catch { /* klasör zaten var */ }
+  serverLogPath = path.join(logDir, 'server.log');
+  const logFd = fs.openSync(serverLogPath, 'a');
+  fs.writeSync(logFd, `\n---- ${new Date().toISOString()} ----\n`);
 
   serverProcess = spawn(serverExe, [], {
+    cwd: exeDir,
     detached: false,
-    stdio: 'ignore',
+    stdio: ['ignore', logFd, logFd],
     windowsHide: true,
   });
 
   serverProcess.on('error', (err) => {
-    console.error('Sunucu başlatılamadı:', err.message);
+    serverStartError = err?.message || String(err);
+    console.error('Sunucu başlatılamadı:', serverStartError);
   });
+  serverProcess.on('exit', (code) => {
+    serverExited = true;
+    if (code && code !== 0 && !serverStartError) {
+      serverStartError = `Sunucu beklenmedik şekilde kapandı (kod ${code}).`;
+    }
+    serverProcess = null;
+  });
+}
+
+function serverFailureMessage() {
+  const detail = serverStartError || readServerLogTail();
+  if (!detail) return 'Sunucu 20 saniye içinde başlamadı.';
+  return `Sunucu başlatılamadı.\n\n${detail}`;
 }
 
 function createMainWindow(url) {
@@ -376,19 +645,80 @@ function createMainWindow(url) {
 
   mainWindow.loadURL(url);
 
+  // Önek karşılaştırması "http://192.168.1.5:3000.evil.com" gibi adresleri de geçirirdi; köken tam eşleşmeli.
+  const appOrigin = (() => { try { return new URL(url).origin; } catch { return null; } })();
+  const isAppUrl = (target) => {
+    try { return !!appOrigin && new URL(target).origin === appOrigin; } catch { return false; }
+  };
+
   mainWindow.webContents.setWindowOpenHandler(({ url: linkUrl }) => {
     if (!linkUrl || linkUrl === '' || linkUrl === 'about:blank') return { action: 'allow' };
-    if (linkUrl.startsWith(url)) return { action: 'allow' };
-    if (linkUrl.startsWith('http')) shell.openExternal(linkUrl);
+    if (isAppUrl(linkUrl)) return { action: 'allow' };
+    if (/^https?:\/\//i.test(linkUrl)) shell.openExternal(linkUrl);
     return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, target) => {
+    if (isAppUrl(target)) return;
+    event.preventDefault();
+    if (/^https?:\/\//i.test(target)) shell.openExternal(target);
   });
 
   mainWindow.on('closed', () => { mainWindow = null; });
 
-  ipcMain.removeAllListeners('print-page');
-  ipcMain.on('print-page', () => {
-    if (mainWindow) mainWindow.webContents.print({ silent: false });
+  // Electron'un Windows yazdırma penceresi önizleme ve ölçek sunmaz.
+  // Çizelge Edge/Chrome'da açılır; tarayıcının yazdırma önizlemesinde
+  // Diğer ayarlar → Ölçek ile küçültülüp büyütülebilir.
+  ipcMain.removeHandler('print-pdf');
+  ipcMain.handle('print-pdf', async (_event, opts = {}) => {
+    const html = typeof opts?.html === 'string' ? opts.html : '';
+    if (!html.trim()) return { ok: false, error: 'Yazdırılacak içerik yok.' };
+    try {
+      const dir = path.join(app.getPath('temp'), 'okul-nobet-yazdir');
+      fs.mkdirSync(dir, { recursive: true });
+      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        try {
+          if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full);
+        } catch { /* açık dosya silinemez */ }
+      }
+      const file = path.join(dir, `cizelge-${Date.now()}.html`);
+      fs.writeFileSync(file, html, 'utf8');
+      const openError = await openInBrowserPrintPreview(file);
+      if (openError) return { ok: false, error: openError };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err?.message || 'Yazdırma penceresi açılamadı.' };
+    }
   });
+}
+
+function findBrowserExecutable() {
+  const pf = process.env.PROGRAMFILES || 'C:\\Program Files';
+  const pf86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+  const local = process.env.LOCALAPPDATA || '';
+  const candidates = [
+    path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(local, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(local, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ];
+  return candidates.find((p) => p && fs.existsSync(p)) || null;
+}
+
+function openInBrowserPrintPreview(file) {
+  const browser = findBrowserExecutable();
+  if (!browser) return shell.openPath(file);
+  try {
+    const child = spawn(browser, ['--new-window', file], { detached: true, stdio: 'ignore' });
+    child.unref();
+    return Promise.resolve('');
+  } catch {
+    return shell.openPath(file);
+  }
 }
 
 // Mod seçim penceresi
@@ -444,18 +774,18 @@ function createSetupWindow() {
     <div class="card" id="cardServer" onclick="selectMode('server')">
       <div class="icon">🖥️</div>
       <h2>Ana Bilgisayar</h2>
-      <p>Programı ilk kuran bilgisayar. Veritabanı burada tutulur.</p>
+      <p>Veriler bu bilgisayarda durur. Lisans ve okul kayıtları buradan yönetilir. Başka yerden bağlanılacaksa bu bilgisayar açık kalmalıdır.</p>
     </div>
     <div class="card" id="cardClient" onclick="selectMode('client')">
       <div class="icon">💻</div>
       <h2>Bağlanan Bilgisayar</h2>
-      <p>Ana bilgisayara bağlanır. Aynı şifre ile giriş yapar.</p>
+      <p>Kayıtlı kurumun verilerine buradan girilir. Ana bilgisayardaki aynı kurum kodu ve şifre geçerlidir; bu bilgisayarda yeni boş kayıt açılmaz.</p>
     </div>
   </div>
   <div class="ip-section" id="ipSection">
     <label>Ana Bilgisayarın IP Adresi</label>
-    <input type="text" id="ipInput" placeholder="Örn: 192.168.1.50" oninput="validateIp()">
-    <div class="hint">Ana bilgisayarda uygulama açıkken başlık çubuğundaki IP adresini buraya girin.</div>
+    <input type="text" id="ipInput" placeholder="Örn: 192.168.1.50 veya https://sunucu-adresi" oninput="validateIp()">
+    <div class="hint">Ana bilgisayarın başlık çubuğundaki IP adresini yazın. Adres başka bir ağdaysa tam adresi girin (ör. https://sunucu). Ana bilgisayar kapalıyken verilere ulaşılamaz.</div>
   </div>
   <button class="btn" id="startBtn" onclick="start()" disabled>Başla</button>
 <script>
@@ -554,6 +884,11 @@ function getExternalBackupDir() {
   return dir;
 }
 
+function localDateStr(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function ensureBackupDir() {
   try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); } catch {}
 }
@@ -571,9 +906,7 @@ function pruneExternalBackups(dir) {
       }))
       .sort((a, b) => b.mtime - a.mtime);
 
-    for (const old of entries.slice(EXTERNAL_BACKUP_MAX)) {
-      try { fs.unlinkSync(old.full); } catch {}
-    }
+    for (const old of entries.slice(EXTERNAL_BACKUP_MAX)) removeBackupFile(old.full);
   } catch (err) {
     console.warn('[backup] Ek klasördeki eski yedekler temizlenemedi:', err?.message || err);
   }
@@ -591,9 +924,7 @@ function pruneOldBackups() {
       }))
       .sort((a, b) => b.mtime - a.mtime);
 
-    for (const old of entries.slice(MAX_BACKUPS)) {
-      try { fs.unlinkSync(old.full); } catch {}
-    }
+    for (const old of entries.slice(MAX_BACKUPS)) removeBackupFile(old.full);
   } catch (err) {
     console.warn('Eski yedekler temizlenemedi:', err?.message || err);
   }
@@ -610,7 +941,7 @@ function backupDatabase(reason = 'manual') {
     const safeReason = String(reason).replace(/[^a-z0-9-]/gi, '');
     const fileName = `database-${ts}-${safeReason}.sqlite`;
     const dest = path.join(BACKUP_DIR, fileName);
-    fs.copyFileSync(DB_FILE, dest);
+    copyDatabaseWithWal(DB_FILE, dest);
     pruneOldBackups();
     console.log(`[backup] Veritabanı yedeklendi (${reason}):`, dest);
 
@@ -624,7 +955,7 @@ function backupDatabase(reason = 'manual') {
       try {
         fs.mkdirSync(extDir, { recursive: true });
         externalPath = path.join(extDir, fileName);
-        fs.copyFileSync(DB_FILE, externalPath);
+        copyDatabaseWithWal(DB_FILE, externalPath);
         pruneExternalBackups(extDir);
         console.log('[backup] Ek konuma da kopyalandı:', externalPath);
       } catch (err) {
@@ -646,7 +977,7 @@ function maybeRunStartupBackup() {
   try {
     if (appMode !== 'server') return; // İstemci modunda lokal DB yok
     if (!fs.existsSync(DB_FILE)) return;
-    const today = new Date().toISOString().split('T')[0];
+    const today = localDateStr();
     const flagPath = path.join(BACKUP_DIR, `.${STARTUP_BACKUP_KEY}`);
     let last = null;
     try { last = fs.readFileSync(flagPath, 'utf-8').trim(); } catch {}
@@ -682,8 +1013,75 @@ function listBackups() {
   }
 }
 
+function startUpdateChecks() {
+  if (isDev) return;
+  setTimeout(() => {
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.error('Güncelleme kontrolü başarısız:', err?.message || err);
+    });
+  }, 5000);
+
+  // Her 4 saatte bir güncelleme kontrolü
+  setInterval(() => {
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.error('Periyodik güncelleme kontrolü başarısız:', err?.message || err);
+    });
+  }, 4 * 60 * 60 * 1000);
+}
+
+// Bu bilgisayardaki eski veritabanının tam kopyası (WAL'daki son değişiklikler dahil).
+function readLocalDatabaseSnapshot() {
+  if (!fs.existsSync(DB_FILE)) return null;
+  try {
+    const Database = require('better-sqlite3');
+    const local = new Database(DB_FILE, { fileMustExist: true });
+    try {
+      local.pragma('wal_checkpoint(TRUNCATE)');
+      return local.serialize();
+    } finally {
+      local.close();
+    }
+  } catch (err) {
+    console.warn('[migrate] Veritabanı SQLite ile okunamadı, dosya doğrudan okunuyor:', err?.message || err);
+    return fs.readFileSync(DB_FILE);
+  }
+}
+
+ipcMain.handle('migrate:has-local-db', () => fs.existsSync(DB_FILE));
+
+// Eski veritabanı yalnızca ortak (bulut) sunucuya taşınmak üzere ve uygulamanın kendi sayfasına verilir.
+ipcMain.handle('migrate:read-local-db', (evt) => {
+  if (appMode !== 'cloud' || !isTrustedSender(evt)) return null;
+  const buf = readLocalDatabaseSnapshot();
+  return buf ? new Uint8Array(buf) : null;
+});
+
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) return;
   let settings = loadSettings();
+  const cloudUrl = readCloudUrl();
+
+  if (cloudUrl) {
+    appMode = 'cloud';
+    serverUrl = cloudUrl;
+    for (;;) {
+      if (await waitForServer(`${serverUrl}/api/health`, 15000)) break;
+      const response = await dialog.showMessageBox({
+        type: 'error',
+        title: 'Bağlantı Hatası',
+        message: `Sunucuya bağlanılamadı.\n\n${serverUrl}\n\nİnternet bağlantınızı kontrol edip tekrar deneyin.`,
+        buttons: ['Tekrar Dene', 'Çıkış'],
+        defaultId: 0,
+      });
+      if (response.response !== 0) { app.quit(); return; }
+    }
+    createMainWindow(serverUrl);
+    startUpdateChecks();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createMainWindow(serverUrl);
+    });
+    return;
+  }
 
   // İlk çalışma veya ayar yoksa mod seçim ekranı göster
   if (!settings) {
@@ -696,11 +1094,11 @@ app.whenReady().then(async () => {
   appMode = settings.mode;
 
   if (appMode === 'server') {
-    startServer();
-    serverUrl = `http://localhost:${PORT}`;
-    const ready = await waitForServer(serverUrl);
+    await startServer();
+    serverUrl = `http://127.0.0.1:${PORT}`;
+    const ready = await waitForServer(serverUrl, 45000);
     if (!ready) {
-      dialog.showErrorBox('Hata', 'Sunucu 20 saniye içinde başlamadı.');
+      dialog.showErrorBox('Hata', serverFailureMessage());
       app.quit();
       return;
     }
@@ -713,7 +1111,7 @@ app.whenReady().then(async () => {
     }
   } else {
     // İstemci modu: sunucu IP'sine bağlan
-    serverUrl = `http://${settings.serverIp}:${PORT}`;
+    serverUrl = resolveServerUrl(settings.serverIp);
     const ready = await waitForServer(serverUrl, 10000);
     if (!ready) {
       const response = await dialog.showMessageBox({
@@ -750,20 +1148,7 @@ app.whenReady().then(async () => {
     try { maybeRunStartupBackup(); } catch {}
   }, 3000);
 
-  if (!isDev) {
-    setTimeout(() => {
-      autoUpdater.checkForUpdates().catch((err) => {
-        console.error('Güncelleme kontrolü başarısız:', err?.message || err);
-      });
-    }, 5000);
-
-    // Her 4 saatte bir güncelleme kontrolü
-    setInterval(() => {
-      autoUpdater.checkForUpdates().catch((err) => {
-        console.error('Periyodik güncelleme kontrolü başarısız:', err?.message || err);
-      });
-    }, 4 * 60 * 60 * 1000);
-  }
+  startUpdateChecks();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

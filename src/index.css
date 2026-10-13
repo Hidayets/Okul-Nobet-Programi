@@ -2,6 +2,331 @@
 
 @theme {
   --color-surface: #ffffff;
+  --color-app-bg: #eef4fb;
+  --color-app-sidebar: #1a4a8a;
+  --color-app-primary: #2c7be5;
+  --color-app-primary-dark: #1a5bb8;
+}
+
+/* ── Uygulama kabuğu (mockup tasarım) ─────────────── */
+.app-shell {
+  background: var(--color-app-bg);
+  color: #1e3a5f;
+}
+
+.app-sidebar {
+  background: linear-gradient(180deg, #1e4d8c 0%, #163d72 100%);
+  box-shadow: 2px 0 12px rgba(26, 74, 138, 0.15);
+}
+
+@media (min-width: 769px) {
+  .app-shell {
+    height: 100vh;
+    max-height: 100vh;
+    overflow: hidden;
+  }
+
+  .app-sidebar {
+    position: relative;
+    z-index: 30;
+    height: 100%;
+    max-height: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+
+  .app-content {
+    height: 100%;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+}
+
+@media print {
+  .app-shell,
+  .app-content,
+  .app-sidebar {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+}
+
+.app-sidebar-logo {
+  display: flex;
+  justify-content: center;
+  padding: 1.5rem 1rem 1rem;
+}
+
+.app-logo-ring {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4a9eff 0%, #2c7be5 50%, #1a5bb8 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 16px rgba(44, 123, 229, 0.4), inset 0 2px 4px rgba(255,255,255,0.2);
+  border: 3px solid rgba(255,255,255,0.15);
+}
+
+.app-logo-n {
+  font-size: 2rem;
+  font-weight: 800;
+  color: white;
+  text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+.app-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.625rem 0.875rem;
+  border-radius: 0.625rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: rgba(255,255,255,0.75);
+  transition: all 0.2s ease;
+  text-align: left;
+}
+
+.app-nav-item:hover {
+  color: white;
+  background: rgba(255,255,255,0.08);
+}
+
+.app-nav-item-active {
+  color: white;
+  background: linear-gradient(90deg, #3b8ef0 0%, #2c7be5 100%);
+  box-shadow: 0 2px 8px rgba(44, 123, 229, 0.35);
+}
+
+.app-sidebar-user {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 1rem;
+  margin: 0.5rem;
+  border-radius: 0.75rem;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+
+.app-user-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255,255,255,0.8);
+}
+
+.app-banner {
+  position: relative;
+  background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 40%, #e0f2fe 100%);
+  border-bottom: 1px solid #93c5fd;
+  overflow: hidden;
+}
+
+.app-banner::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 120px 60px at 15% 80%, rgba(147,197,253,0.5) 0%, transparent 70%),
+    radial-gradient(ellipse 100px 50px at 85% 70%, rgba(191,219,254,0.4) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.app-banner-content {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.25rem 1.5rem;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.app-banner-title {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.375rem;
+  font-weight: 700;
+  color: #1a4a8a;
+  letter-spacing: -0.01em;
+}
+
+.app-banner-subtitle {
+  font-size: 0.8125rem;
+  color: #3b7dd8;
+  font-style: italic;
+  margin-top: 0.125rem;
+}
+
+.app-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.app-year-select {
+  appearance: none;
+  background: rgba(255,255,255,0.85);
+  border: 1px solid #93c5fd;
+  border-radius: 0.5rem;
+  padding: 0.375rem 2rem 0.375rem 2rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #1a4a8a;
+  cursor: pointer;
+}
+
+.app-version-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.625rem;
+  border-radius: 0.375rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  background: rgba(255,255,255,0.7);
+  border: 1px solid #93c5fd;
+  color: #1a4a8a;
+  transition: background 0.15s;
+}
+
+.app-version-badge:hover { background: white; }
+.app-version-badge-ready { background: #dcfce7; border-color: #86efac; color: #166534; }
+.app-version-badge-progress { background: #dbeafe; border-color: #93c5fd; color: #1d4ed8; }
+
+.app-icon-btn {
+  padding: 0.375rem;
+  border-radius: 0.375rem;
+  color: #1a4a8a;
+  background: rgba(255,255,255,0.5);
+  border: 1px solid rgba(147,197,253,0.5);
+  transition: all 0.15s;
+}
+
+.app-icon-btn:hover {
+  background: white;
+  color: #2c7be5;
+}
+
+.app-main {
+  padding: 1.25rem 1.5rem;
+}
+
+.app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.625rem 1.5rem;
+  font-size: 0.6875rem;
+  color: #64748b;
+  border-top: 1px solid #cbd5e1;
+  background: rgba(255,255,255,0.6);
+}
+
+.app-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 6px rgba(34,197,94,0.5);
+}
+
+/* Kart ve buton stilleri */
+.app-card {
+  background: white;
+  border-radius: 0.875rem;
+  border: 1px solid #dbeafe;
+  box-shadow: 0 1px 4px rgba(44,123,229,0.06);
+}
+
+.app-card-header {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid #e0ecfa;
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+  border-radius: 0.875rem 0.875rem 0 0;
+}
+
+.app-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem 0.875rem;
+  border-radius: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  transition: all 0.15s;
+  border: 1px solid transparent;
+}
+
+.app-btn-primary {
+  background: linear-gradient(180deg, #34d399 0%, #10b981 100%);
+  color: white;
+  box-shadow: 0 1px 3px rgba(16,185,129,0.3);
+}
+.app-btn-primary:hover { filter: brightness(1.05); }
+
+.app-btn-blue {
+  background: white;
+  color: #2c7be5;
+  border-color: #93c5fd;
+}
+.app-btn-blue:hover { background: #eff6ff; }
+
+.app-btn-red {
+  background: white;
+  color: #ef4444;
+  border-color: #fca5a5;
+}
+.app-btn-red:hover { background: #fef2f2; }
+
+.app-btn-green-outline {
+  background: white;
+  color: #059669;
+  border-color: #6ee7b7;
+}
+.app-btn-green-outline:hover { background: #ecfdf5; }
+
+/* Öğretmen renk etiketleri */
+.teacher-chip-blue   { background: #dbeafe; color: #1e40af; border-color: #93c5fd; }
+.teacher-chip-green  { background: #dcfce7; color: #166534; border-color: #86efac; }
+.teacher-chip-amber  { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+.teacher-chip-pink   { background: #fce7f3; color: #9d174d; border-color: #f9a8d4; }
+.teacher-chip-purple { background: #ede9fe; color: #5b21b6; border-color: #c4b5fd; }
+.teacher-chip-cyan   { background: #cffafe; color: #0e7490; border-color: #67e8f9; }
+.teacher-chip-orange { background: #ffedd5; color: #9a3412; border-color: #fdba74; }
+.teacher-chip-teal   { background: #ccfbf1; color: #115e59; border-color: #5eead4; }
+
+@media (max-width: 768px) {
+  .app-shell { flex-direction: column; }
+  .app-sidebar {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding-bottom: 0.5rem;
+  }
+  .app-sidebar-logo { padding: 0.75rem; }
+  .app-logo-ring { width: 48px; height: 48px; }
+  .app-logo-n { font-size: 1.25rem; }
+  .app-sidebar nav {
+    display: flex;
+    flex-wrap: wrap;
+    flex: 1;
+    gap: 0.25rem;
+    padding: 0 0.5rem;
+  }
+  .app-nav-item { padding: 0.375rem 0.625rem; font-size: 0.75rem; }
+  .app-sidebar-user { display: none; }
 }
 
 /* ── Light (default) ─────────────────────────────── */
@@ -140,4 +465,45 @@
   --color-indigo-500: #a855f7;
   --color-indigo-600: #9333ea;
   --color-indigo-700: #7e22ce;
+}
+
+/* Sekme ve çizelge başlık geçişleri */
+@keyframes tab-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.tab-panel-enter {
+  animation: tab-panel-in 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes week-header-in {
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-week-header {
+  animation: week-header-in 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.schedule-th-transition {
+  transition: background-color 0.35s ease, color 0.35s ease, border-color 0.35s ease;
+}
+
+.print-color-exact,
+.print-color-exact * {
+  -webkit-print-color-adjust: exact !important;
+  print-color-adjust: exact !important;
 }

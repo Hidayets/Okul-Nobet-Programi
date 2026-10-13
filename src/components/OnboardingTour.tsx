@@ -56,8 +56,10 @@ const STEPS: Step[] = [
     body: (
       <>
         Öğretmenleri buradan ekleyebilir, düzenleyebilir veya silebilirsiniz. Her öğretmen için{' '}
-        <strong>Sabit / Hareketli / Nöbet Dışı</strong> tipi belirleyin. Nöbet tercihlerini
-        <strong> "tutamaz"</strong> veya <strong>"sadece şu günler"</strong> olarak ayarlayabilirsiniz.
+        <strong>Sabit / Hareketli / Nöbet Dışı</strong> tipi belirleyin.
+        <strong> Sabit</strong> öğretmen her hafta aynı nöbet yerinde kalır;{' '}
+        <strong>Hareketli</strong> öğretmen aynı günde kalır, nöbet yeri haftalık döner.
+        Nöbet tercihlerini <strong>"tutamaz"</strong> veya <strong>"sadece şu günler"</strong> olarak ayarlayabilirsiniz.
       </>
     ),
     tip: 'Yeni: Word veya e-okul listesini Panodan Ekle ile tek tıkla içe alabilirsiniz.',
@@ -91,9 +93,9 @@ const STEPS: Step[] = [
     tabId: 'generator',
     body: (
       <>
-        Tarih aralığı + dağıtım modu (dönerli / merdiven) seçin ve <strong>Otomatik Oluştur</strong>'a
-        basın. Sistem öğretmen tercihlerini, ders sayılarını ve müsaitlikleri dikkate alarak adil bir
-        çizelge üretir.
+        Tarih aralığı + dağıtım modu seçin ve program oluşturun. Sistem öğretmen tercihlerini,
+        <strong> günlük ders yükünü</strong> (o gün az dersi olan öncelikli) ve müsaitlikleri dikkate alarak
+        yıl boyunca adil bir çizelge üretir.
       </>
     ),
   },
@@ -104,6 +106,9 @@ const STEPS: Step[] = [
     body: (
       <>
         Hazır çizelgeyi buradan görebilir, yazdırabilir ve e-posta olarak gönderebilirsiniz.
+        Günün panosu o günün nöbet, devamsızlık ve ders görevini tek sayfada yazdırır.
+        Geri al, son nöbet değişikliğini eski haline getirir. Öğretmen girişi yalnızca kendi nöbet listesini görür; WhatsApp metni oradan kopyalanır.
+        <strong> Öğretmen Nöbet Sayıları</strong> panelinden toplam, nöbet yeri ve aylık dağılımı kontrol edin.
         Hücredeki öğretmene tıklayarak <strong>başkasıyla değiştirebilir</strong>,{' '}
         <strong>çift nöbet</strong> işaretleyebilir veya silebilirsiniz.
       </>

@@ -8,8 +8,13 @@ interface Props {
 type LicenseCheck =
   | { state: 'idle' }
   | { state: 'checking' }
-  | { state: 'ok'; okulAdi?: string | null; expiresAt?: string | null }
-  | { state: 'error'; reason: 'not-found' | 'inactive' | 'expired' | 'network' };
+  | { state: 'ok'; okulAdi?: string | null; expiresAt?: string | null; registered: boolean }
+  | {
+      state: 'error';
+      reason: 'not-found' | 'inactive' | 'expired' | 'network' | 'already-registered';
+      okulAdi?: string | null;
+      registered?: boolean;
+    };
 
 export default function Register({ onBackToLogin }: Props) {
   const [kurumKodu, setKurumKodu] = useState('');
@@ -27,7 +32,11 @@ export default function Register({ onBackToLogin }: Props) {
     return parts.join('-');
   };
 
-  // Kurum kodu girildikçe (debounced) lisans kaydını kontrol et
+  const alreadyRegistered =
+    (licCheck.state === 'ok' && licCheck.registered) ||
+    (licCheck.state === 'error' && (licCheck.reason === 'already-registered' || licCheck.registered));
+
+  // Kurum kodu girildikçe (debounced) lisans + önceki kayıt durumunu kontrol et
   useEffect(() => {
     const cleanKurumKodu = kurumKodu.trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     if (!cleanKurumKodu) {
@@ -42,12 +51,33 @@ export default function Register({ onBackToLogin }: Props) {
         if (!res.ok) throw new Error('network');
         const data = await res.json();
         if (cancelled) return;
+
+        if (data.registered) {
+          setLicCheck({
+            state: 'error',
+            reason: 'already-registered',
+            okulAdi: data.okulAdi,
+            registered: true,
+          });
+          return;
+        }
+
         if (!data.exists) {
-          setLicCheck({ state: 'error', reason: 'not-found' });
+          setLicCheck({ state: 'error', reason: 'not-found', registered: false });
         } else if (!data.ok) {
-          setLicCheck({ state: 'error', reason: data.reason || 'not-found' });
+          setLicCheck({
+            state: 'error',
+            reason: data.reason || 'not-found',
+            okulAdi: data.okulAdi,
+            registered: false,
+          });
         } else {
-          setLicCheck({ state: 'ok', okulAdi: data.okulAdi, expiresAt: data.expiresAt });
+          setLicCheck({
+            state: 'ok',
+            okulAdi: data.okulAdi,
+            expiresAt: data.expiresAt,
+            registered: false,
+          });
         }
       } catch {
         if (!cancelled) setLicCheck({ state: 'error', reason: 'network' });
@@ -58,6 +88,11 @@ export default function Register({ onBackToLogin }: Props) {
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (alreadyRegistered) {
+      setError('Bu okul zaten kayıtlı. Giriş sayfasından mevcut kullanıcı adı ve şifrenizle giriş yapın.');
+      return;
+    }
     
     const cleanKurumKodu = kurumKodu.trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     const cleanLicense = licenseKey.replace(/-/g, '').trim();
@@ -149,7 +184,8 @@ export default function Register({ onBackToLogin }: Props) {
           İlk Kurulum (Okul Kaydı)
         </h2>
         <p className="mt-2 text-center text-sm text-slate-600 px-4">
-          Okulunuzun nöbet programını oluşturmak ve öğretmenlerinizle paylaşmak için kurum kodunuzu ve şifrelerinizi belirleyin.
+          Yalnızca daha önce kayıt olmamış okullar için. Size verilen yeni lisans anahtarı ile kurulum yapın.
+          Daha önce kayıt olduysanız giriş sayfasını kullanın; lisans bitince yalnızca uzatma yeterlidir.
         </p>
       </div>
 
@@ -159,6 +195,26 @@ export default function Register({ onBackToLogin }: Props) {
             {error && (
               <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-lg text-sm">
                 {error}
+              </div>
+            )}
+
+            {alreadyRegistered && (
+              <div className="bg-amber-50 border border-amber-200 text-amber-900 px-4 py-3 rounded-lg text-sm space-y-2">
+                <p className="font-medium">
+                  {licCheck.state === 'error' && licCheck.okulAdi
+                    ? `${licCheck.okulAdi} zaten kayıtlı.`
+                    : 'Bu kurum kodu ile daha önce kayıt yapılmış.'}
+                </p>
+                <p>
+                  Yeniden kayıt veya yeni lisans gerekmez. Lisans uzatıldığında aynı kullanıcı adı ve şifre ile giriş yapabilirsiniz.
+                </p>
+                <button
+                  type="button"
+                  onClick={onBackToLogin}
+                  className="text-indigo-700 font-semibold hover:underline"
+                >
+                  Giriş sayfasına dön →
+                </button>
               </div>
             )}
 
@@ -183,25 +239,25 @@ export default function Register({ onBackToLogin }: Props) {
                   {licCheck.state === 'checking' && (
                     <Loader2 className="w-4 h-4 text-slate-400 animate-spin" />
                   )}
-                  {licCheck.state === 'ok' && (
+                  {licCheck.state === 'ok' && !licCheck.registered && (
                     <CheckCircle2 className="w-4 h-4 text-emerald-500" />
                   )}
                   {licCheck.state === 'error' && (
-                    <AlertCircle className="w-4 h-4 text-red-500" />
+                    <AlertCircle className={`w-4 h-4 ${licCheck.reason === 'already-registered' ? 'text-amber-500' : 'text-red-500'}`} />
                   )}
                 </div>
               </div>
-              {licCheck.state === 'ok' && (
+              {licCheck.state === 'ok' && !licCheck.registered && (
                 <p className="mt-1 text-xs text-emerald-700">
                   ✓ {licCheck.okulAdi || 'Lisans bulundu'}
                   {licCheck.expiresAt && ` • ${new Date(licCheck.expiresAt).toLocaleDateString('tr-TR')} tarihine kadar geçerli`}
                 </p>
               )}
-              {licCheck.state === 'error' && (
-                <p className="mt-1 text-xs text-red-600">
-                  {licCheck.reason === 'not-found' && 'Bu kurum kodu için lisans tanımlı değil.'}
-                  {licCheck.reason === 'inactive' && 'Lisans pasif durumda.'}
-                  {licCheck.reason === 'expired' && 'Lisansın süresi dolmuş.'}
+              {licCheck.state === 'error' && licCheck.reason !== 'already-registered' && (
+                <p className="mt-1 text-xs text-slate-600">
+                  {licCheck.reason === 'not-found' && 'Sistemde henüz lisans kaydı yok. Size verilen yeni lisans anahtarı ile kayıt olabilirsiniz.'}
+                  {licCheck.reason === 'inactive' && 'Lisans pasif durumda. Yönetici etkinleştirdikten sonra ilk kurulumu tamamlayabilirsiniz.'}
+                  {licCheck.reason === 'expired' && 'Lisansın süresi dolmuş. Yönetici uzattıktan sonra ilk kurulumu tamamlayabilirsiniz.'}
                   {licCheck.reason === 'network' && 'Lisans kontrolü yapılamadı.'}
                 </p>
               )}
@@ -212,7 +268,7 @@ export default function Register({ onBackToLogin }: Props) {
                 Lisans Anahtarı
               </label>
               <p className="text-xs text-slate-500 mb-2">
-                Size verilen tek seferlik lisans anahtarını girin.
+                Yalnızca ilk kurulum için size verilen lisans anahtarını girin.
               </p>
               <div className="mt-1 relative rounded-md shadow-sm">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
@@ -222,9 +278,10 @@ export default function Register({ onBackToLogin }: Props) {
                   id="licenseKey"
                   type="text"
                   required
+                  disabled={alreadyRegistered}
                   value={licenseKey}
                   onChange={(e) => setLicenseKey(formatLicenseInput(e.target.value))}
-                  className="focus:ring-indigo-500 focus:border-indigo-500 block w-full pl-10 sm:text-sm border-slate-300 rounded-md py-2 border font-mono tracking-wider"
+                  className="focus:ring-indigo-500 focus:border-indigo-500 block w-full pl-10 sm:text-sm border-slate-300 rounded-md py-2 border font-mono tracking-wider disabled:bg-slate-100 disabled:text-slate-400"
                   placeholder="XXXX-XXXX-XXXX-XXXX"
                   maxLength={19}
                 />
@@ -247,9 +304,10 @@ export default function Register({ onBackToLogin }: Props) {
                   id="adminPassword"
                   type="password"
                   required
+                  disabled={alreadyRegistered}
                   value={adminPassword}
                   onChange={(e) => setAdminPassword(e.target.value)}
-                  className="focus:ring-indigo-500 focus:border-indigo-500 block w-full pl-10 sm:text-sm border-slate-300 rounded-md py-2 border"
+                  className="focus:ring-indigo-500 focus:border-indigo-500 block w-full pl-10 sm:text-sm border-slate-300 rounded-md py-2 border disabled:bg-slate-100"
                   placeholder="En az 6 karakter"
                 />
               </div>
@@ -271,9 +329,10 @@ export default function Register({ onBackToLogin }: Props) {
                   id="teacherPassword"
                   type="password"
                   required
+                  disabled={alreadyRegistered}
                   value={teacherPassword}
                   onChange={(e) => setTeacherPassword(e.target.value)}
-                  className="focus:ring-indigo-500 focus:border-indigo-500 block w-full pl-10 sm:text-sm border-slate-300 rounded-md py-2 border"
+                  className="focus:ring-indigo-500 focus:border-indigo-500 block w-full pl-10 sm:text-sm border-slate-300 rounded-md py-2 border disabled:bg-slate-100"
                   placeholder="En az 6 karakter"
                 />
               </div>
@@ -282,7 +341,7 @@ export default function Register({ onBackToLogin }: Props) {
             <div>
               <button
                 type="submit"
-                disabled={loading}
+                disabled={loading || alreadyRegistered}
                 className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:opacity-70"
               >
                 {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Kurulumu Tamamla'}

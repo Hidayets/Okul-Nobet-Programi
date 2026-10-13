@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync } from 'fs';
-import { homedir } from 'os';
+import { mkdirSync, readFileSync, existsSync, renameSync, readdirSync, unlinkSync, writeFileSync } from 'fs';
+import { homedir, tmpdir } from 'os';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -10,6 +10,7 @@ import cors from 'cors';
 import nodemailer from 'nodemailer';
 import crypto from 'crypto';
 import { config as loadDotenv } from 'dotenv';
+import { parseMebCalendarHtml, resolveMebCalendarUrls } from './src/lib/mebCalendarParse.ts';
 
 // CJS (pkg/esbuild) ve ESM (tsx dev) ortamlarında güvenle çalışır
 const __dirname = process.cwd();
@@ -32,12 +33,27 @@ const __dirname = process.cwd();
   }
 })();
 
+// .env.example'daki örnek değerler gerçek anahtar sayılmaz.
+const PLACEHOLDER_SECRETS = new Set([
+  'change-me-in-production-use-a-long-random-string',
+]);
+
+function envSecret(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  if (PLACEHOLDER_SECRETS.has(value)) {
+    console.warn(`[auth] ${name} örnek değerde bırakılmış; yok sayıldı.`);
+    return undefined;
+  }
+  return value;
+}
+
 // Üretimde varsayılan sırlar kullanılıyorsa görünür şekilde uyar.
 if (!process.env.LICENSE_SECRET) {
   console.warn('[license] LICENSE_SECRET çevresel değişkeni bulunamadı, varsayılan değer kullanılıyor. Üretimde mutlaka .env dosyasında ayarlayın.');
 }
-if (!process.env.JWT_SECRET) {
-  console.warn('[auth] JWT_SECRET çevresel değişkeni bulunamadı, varsayılan değer kullanılıyor. Üretimde mutlaka .env dosyasında ayarlayın.');
+if (!envSecret('JWT_SECRET')) {
+  console.warn('[auth] JWT_SECRET çevresel değişkeni bulunamadı, veritabanında saklanan rastgele anahtar kullanılacak.');
 }
 
 // Sürüm bilgisi: package.json'dan oku, başarısızsa fallback
@@ -55,15 +71,35 @@ try {
   } catch {}
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key-for-local-dev';
-
 // ---- Lisans Sistemi ----
 // Bu değeri kendinize özel bir şeyle değiştirin ve kimseyle paylaşmayın.
 // generate-license.cjs dosyasındaki değerle aynı olmalıdır.
 const LICENSE_SECRET = process.env.LICENSE_SECRET || 'okul-nobet-2025-BURAYA-KENDI-GIZLI-ANAHTARINIZI-YAZIN';
 
-// Özel giriş anahtarı - Login.tsx ile aynı olmalı
-const SUPER_ADMIN_KEY = '342665';
+// Özel giriş anahtarı. Yalnızca sunucuda doğrulanır; .env ile değiştirilebilir.
+// .env'de yoksa kaynak koddaki varsayılan yalnızca bu bilgisayardan (127.0.0.1) yapılan girişte geçerlidir;
+// ağdaki diğer bilgisayarlardan ve bulut sunucusunda bu varsayılanla giriş yapılamaz.
+const SUPER_ADMIN_KEY_ENV = envSecret('SUPER_ADMIN_KEY');
+const DEFAULT_SUPER_ADMIN_KEY = '342665';
+const SUPER_ADMIN_KEY = SUPER_ADMIN_KEY_ENV || DEFAULT_SUPER_ADMIN_KEY;
+if (!SUPER_ADMIN_KEY_ENV) {
+  console.warn('[auth] SUPER_ADMIN_KEY ayarlı değil; özel giriş yalnızca bu bilgisayardan yapılabilir.');
+}
+
+function isLoopbackRequest(req: any): boolean {
+  const addr = String(req.socket?.remoteAddress || '');
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+function superAdminLoginAllowed(req: any): boolean {
+  if (SUPER_ADMIN_KEY_ENV) return true;
+  return !process.env.DATA_DIR && isLoopbackRequest(req);
+}
+
+/** Token'ı şifreye/anahtara bağlayan kısa parmak izi: şifre değişince eski oturumlar geçersiz olur. */
+function secretFingerprint(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex').slice(0, 16);
+}
 
 function generateLicenseKey(kurumKodu: string): string {
   const hmac = crypto.createHmac('sha256', LICENSE_SECRET);
@@ -300,7 +336,10 @@ function checkLicenseRecord(kurumKodu: string): {
   license?: any;
 } {
   const license: any = db.prepare('SELECT * FROM licenses WHERE kurumKodu = ?').get(kurumKodu);
-  if (!license) return { ok: false, reason: 'not-found' };
+  if (!license) {
+    // Süper yöneticinin sildiği lisans, kaydı olmayan eski okul gibi serbest bırakılmaz.
+    return isLicenseRevoked(kurumKodu) ? { ok: false, reason: 'inactive' } : { ok: false, reason: 'not-found' };
+  }
   if (!license.isActive) return { ok: false, reason: 'inactive', license };
   if (license.expiresAt) {
     const endMs = licenseEndOfDayMs(license.expiresAt);
@@ -309,6 +348,43 @@ function checkLicenseRecord(kurumKodu: string): {
     }
   }
   return { ok: true, license };
+}
+
+const revokedLicenseKey = (kurumKodu: string) => `license_revoked:${kurumKodu}`;
+
+function isLicenseRevoked(kurumKodu: string): boolean {
+  return !!db.prepare('SELECT 1 FROM meta WHERE key = ?').get(revokedLicenseKey(kurumKodu));
+}
+
+function setLicenseRevoked(kurumKodu: string, revoked: boolean): void {
+  if (revoked) {
+    db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(revokedLicenseKey(kurumKodu), new Date().toISOString());
+  } else {
+    db.prepare('DELETE FROM meta WHERE key = ?').run(revokedLicenseKey(kurumKodu));
+  }
+}
+
+/**
+ * Lisans sistemi öncesinden kalan (lisans kaydı olmayan) okul için süresiz bir kayıt açar.
+ * Böylece süper yönetici bu okulu da listede görür; pasifleştirebilir veya silebilir.
+ */
+function ensureLegacyLicense(kurumKodu: string): ReturnType<typeof checkLicenseRecord> {
+  const lic = checkLicenseRecord(kurumKodu);
+  if (lic.reason !== 'not-found') return lic;
+  const hasUsers = !!db.prepare('SELECT 1 FROM users WHERE kurumKodu = ? LIMIT 1').get(kurumKodu);
+  if (!hasUsers) return lic;
+  let okulAdi = `Kurum ${kurumKodu}`;
+  try {
+    const row: any = db.prepare("SELECT data FROM documents WHERE collection = 'schoolInfo' AND id = 'info' AND kurumKodu = ?").get(kurumKodu);
+    const name = row ? String(JSON.parse(row.data)?.okulAdi || '').trim() : '';
+    if (name) okulAdi = name;
+  } catch { /* varsayılan ad kalır */ }
+  db.prepare(`
+    INSERT OR IGNORE INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive)
+    VALUES (?, ?, ?, ?, ?, NULL, 1)
+  `).run(uuidv4(), kurumKodu, okulAdi, generateLicenseKey(kurumKodu), new Date().toISOString());
+  console.log(`[license] ${kurumKodu} için eski kurulumdan lisans kaydı oluşturuldu.`);
+  return checkLicenseRecord(kurumKodu);
 }
 
 // İstemciye gönderilecek özet lisans bilgisi (gizli alanlar hariç)
@@ -346,14 +422,86 @@ const isPkg = !!(process as any).pkg;
 // Uygulama dizini: pkg'da exe'nin yanı, geliştirmede cwd
 const APP_DIR = isPkg ? path.dirname(process.execPath) : process.cwd();
 
-// Veritabanı: pkg'da AppData\Local\OkulNobetProgrami, geliştirmede cwd
-const DB_DIR = isPkg
-  ? path.join(homedir(), 'AppData', 'Local', 'OkulNobetProgrami')
-  : process.cwd();
+// Bulut sunucusunda DATA_DIR kalıcı diske işaret eder (konteyner yeniden başlayınca veri silinmesin).
+// Tek veritabanı: kurulu uygulama ve bu bilgisayardaki web aynı dosyayı kullanır.
+// Aksi halde süper yönetici uygulamada başka, webde başka lisans görür.
+const DB_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : process.platform === 'win32'
+    ? path.join(homedir(), 'AppData', 'Local', 'OkulNobetProgrami')
+    : (isPkg ? path.dirname(process.execPath) : process.cwd());
 mkdirSync(DB_DIR, { recursive: true });
 
 // Initialize SQLite Database
-const db = new Database(path.join(DB_DIR, 'database.sqlite'));
+const DB_FILE = path.join(DB_DIR, 'database.sqlite');
+const db = new Database(DB_FILE);
+db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
+
+interface ImportCounts {
+  licenses: number;
+  users: number;
+  documents: number;
+}
+
+/**
+ * Başka bir veritabanı dosyasındaki lisans, kullanıcı ve kayıtları bu veritabanına ekler.
+ * Var olan satırların üzerine yazılmaz. `kurumKodu` verilirse yalnızca o kurumun satırları alınır.
+ */
+function importDatabaseFile(sourcePath: string, kurumKodu?: string): ImportCounts {
+  const src = new Database(sourcePath, { readonly: true, fileMustExist: true });
+  try {
+    const tables = new Set(
+      (src.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map(t => t.name),
+    );
+    const copyTable = (table: string) => {
+      if (!tables.has(table)) return 0;
+      const srcCols = (src.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(c => c.name);
+      const dstCols = (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(c => c.name);
+      const cols = dstCols.filter(c => srcCols.includes(c));
+      if (cols.length === 0) return 0;
+      if (kurumKodu && !cols.includes('kurumKodu')) return 0;
+      const before = (db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
+      const placeholders = cols.map(() => '?').join(', ');
+      const insert = db.prepare(`INSERT OR IGNORE INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`);
+      const select = `SELECT ${cols.join(', ')} FROM ${table}${kurumKodu ? ' WHERE kurumKodu = ?' : ''}`;
+      let rows = (kurumKodu ? src.prepare(select).all(kurumKodu) : src.prepare(select).all()) as Record<string, unknown>[];
+      if (table === 'users') {
+        // Yüklenen dosyadan yalnız kurumun admin/öğretmen hesapları alınır (yetki yükseltme engeli).
+        rows = rows.filter(row => {
+          const role = String(row.role ?? '');
+          if (role !== 'admin' && role !== 'teacher') return false;
+          return !kurumKodu || row.email === `${role}@${kurumKodu}.nobet.app`;
+        });
+      }
+      for (const row of rows) insert.run(...cols.map(c => row[c]));
+      const after = (db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
+      return after - before;
+    };
+    const counts = db.transaction(() => ({
+      licenses: copyTable('licenses'),
+      users: copyTable('users'),
+      documents: copyTable('documents'),
+    }))();
+    scopeLegacyCollections();
+    return counts;
+  } finally {
+    src.close();
+  }
+}
+
+function mergeOtherDatabase(sourcePath: string): void {
+  if (!existsSync(sourcePath)) return;
+  if (path.resolve(sourcePath) === path.resolve(DB_FILE)) return;
+  try {
+    const added = importDatabaseFile(sourcePath);
+    const backup = `${sourcePath}.birlestirildi`;
+    try { renameSync(sourcePath, backup); } catch { /* dosya kilitliyse yerinde kalır; ekleme yok sayılır */ }
+    console.log(`[db] ${sourcePath} birleştirildi (+${added.licenses} lisans, +${added.users} kullanıcı, +${added.documents} kayıt)`);
+  } catch (err) {
+    console.warn('[db] Diğer veritabanı birleştirilemedi:', sourcePath, err instanceof Error ? err.message : err);
+  }
+}
 
 // Create Tables
 db.exec(`
@@ -395,7 +543,7 @@ const academicYearMigration = db.prepare("SELECT value FROM meta WHERE key = 'ac
 if (!academicYearMigration) {
   const month = new Date().getMonth() + 1;
   const year = new Date().getFullYear();
-  const currentAcademicYear = month >= 9 ? `${year}-${year + 1}` : `${year - 1}-${year}`;
+  const currentAcademicYear = month >= 8 ? `${year}-${year + 1}` : `${year - 1}-${year}`;
   const collectionsToMigrate = ['teachers', 'classes', 'locations', 'assignments', 'absences', 'substitutions'];
 
   db.transaction(() => {
@@ -414,7 +562,13 @@ if (!academicYearMigration) {
 
     const schoolInfoRows = db.prepare("SELECT * FROM documents WHERE collection = 'schoolInfo' AND id = 'info'").all() as any[];
     for (const row of schoolInfoRows) {
-      const data = JSON.parse(row.data);
+      let data: any;
+      try {
+        data = JSON.parse(row.data);
+      } catch {
+        console.warn(`[migration] ${row.kurumKodu} okul bilgisi okunamadı; atlandı.`);
+        continue;
+      }
       data.academicYears = [...new Set([...(data.academicYears || []), currentAcademicYear])].sort();
       db.prepare("UPDATE documents SET data = ? WHERE collection = 'schoolInfo' AND id = 'info' AND kurumKodu = ?").run(
         JSON.stringify(data), row.kurumKodu
@@ -427,12 +581,141 @@ if (!academicYearMigration) {
   console.log(`Migration: scoped collections to academic year ${currentAcademicYear}`);
 }
 
+// Eski sürüm web sunucusu veriyi proje klasöründe tutuyordu. Kurulu uygulama AppData kullanıyordu.
+for (const extra of [path.join(process.cwd(), 'database.sqlite'), path.join(APP_DIR, 'database.sqlite')]) {
+  mergeOtherDatabase(extra);
+}
+
+scopeLegacyCollections();
+
+// Birleşmeden gelen eski (yıla ayrılmamış) kayıtları güncel eğitim yılına bağla.
+function scopeLegacyCollections(): void {
+  const month = new Date().getMonth() + 1;
+  const year = new Date().getFullYear();
+  const currentAcademicYear = month >= 8 ? `${year}-${year + 1}` : `${year - 1}-${year}`;
+  for (const col of ['teachers', 'classes', 'locations', 'assignments', 'absences', 'substitutions']) {
+    const rows = db.prepare('SELECT * FROM documents WHERE collection = ?').all(col) as any[];
+    if (rows.length === 0) continue;
+    const scopedCol = `${col}__${currentAcademicYear}`;
+    const insert = db.prepare('INSERT OR IGNORE INTO documents (collection, id, kurumKodu, data) VALUES (?, ?, ?, ?)');
+    const remove = db.prepare('DELETE FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?');
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        insert.run(scopedCol, row.id, row.kurumKodu, row.data);
+        remove.run(col, row.id, row.kurumKodu);
+      }
+    });
+    tx();
+  }
+}
+
+// Token imza anahtarı: .env'de yoksa kuruluma özel rastgele bir anahtar üretilip saklanır.
+// Kaynak kodda sabit bir anahtar olsaydı herkes geçerli (süper yönetici dahil) token üretebilirdi.
+const JWT_SECRET: string = envSecret('JWT_SECRET') || (() => {
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'jwt_secret'").get() as { value: string } | undefined;
+  if (row?.value) return row.value;
+  const generated = crypto.randomBytes(48).toString('hex');
+  db.prepare("INSERT INTO meta (key, value) VALUES ('jwt_secret', ?)").run(generated);
+  return generated;
+})();
+
+// Basit deneme sınırlayıcı: aynı IP'den kısa sürede çok sayıda başarısız denemeyi engeller.
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILURES = 10;
+const authFailures = new Map<string, { count: number; resetAt: number }>();
+
+function authRateKey(req: any, scope: string): string {
+  return `${scope}|${req.ip || req.socket?.remoteAddress || 'unknown'}`;
+}
+
+function isAuthRateLimited(key: string): boolean {
+  const entry = authFailures.get(key);
+  if (!entry) return false;
+  if (Date.now() > entry.resetAt) {
+    authFailures.delete(key);
+    return false;
+  }
+  return entry.count >= AUTH_MAX_FAILURES;
+}
+
+function recordAuthFailure(key: string) {
+  const now = Date.now();
+  const entry = authFailures.get(key);
+  if (!entry || now > entry.resetAt) {
+    authFailures.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  } else {
+    entry.count++;
+  }
+}
+
+const RATE_LIMIT_MESSAGE = 'Çok fazla başarısız deneme yapıldı. Lütfen 15 dakika sonra tekrar deneyin.';
+
+/** Kaydın sürüm etiketi: içerik değişince değişir. Eşzamanlı düzenlemede üzerine yazmayı önlemek için kullanılır. */
+function revisionOf(dataJson: string): string {
+  return crypto.createHash('sha1').update(dataJson).digest('hex').slice(0, 16);
+}
+
+function stripRevision(body: any): any {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const { _rev, ...rest } = body;
+  return rest;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// Bulutta veri tek kopya olduğundan sunucu kendi günlük yedeğini alır (son 14 gün tutulur).
+function startCloudBackups(): void {
+  if (!process.env.DATA_DIR) return;
+  const backupDir = path.join(DB_DIR, 'backups');
+  mkdirSync(backupDir, { recursive: true });
+  const run = async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const target = path.join(backupDir, `database-${day}.sqlite`);
+    if (existsSync(target)) return;
+    try {
+      await db.backup(target);
+      const old = readdirSync(backupDir)
+        .filter(f => f.startsWith('database-') && f.endsWith('.sqlite'))
+        .sort()
+        .slice(0, -14);
+      for (const f of old) unlinkSync(path.join(backupDir, f));
+      console.log('[backup] Günlük yedek alındı:', target);
+    } catch (err) {
+      console.warn('[backup] Günlük yedek alınamadı:', err instanceof Error ? err.message : err);
+    }
+  };
+  void run();
+  setInterval(() => { void run(); }, 60 * 60 * 1000);
+}
+
+/** Yüklenen veritabanı dosyasını geçici olarak diske yazıp işler, sonra siler. */
+function withUploadedDatabase<T>(body: unknown, fn: (filePath: string) => T): T {
+  if (!Buffer.isBuffer(body) || body.length < 100 || body.subarray(0, 15).toString('latin1') !== 'SQLite format 3') {
+    throw new Error('Geçerli bir veritabanı dosyası (database.sqlite) yükleyin.');
+  }
+  const tmp = path.join(tmpdir(), `okul-nobet-import-${crypto.randomBytes(8).toString('hex')}.sqlite`);
+  writeFileSync(tmp, body);
+  try {
+    return fn(tmp);
+  } finally {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+  }
+}
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
+
+  // Bulut barındırıcıları istekleri bir vekil sunucu üzerinden iletir; deneme sınırı gerçek IP'ye uygulanmalı.
+  if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 
   app.use(cors());
-  app.use(express.json());
+  // Arşivlenen nöbet çizelgeleri tek belgede tutulduğundan varsayılan 100kb sınırı yetmez.
+  app.use(express.json({ limit: '50mb' }));
 
   // --- API Routes ---
 
@@ -445,21 +728,64 @@ async function startServer() {
 
     jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
       if (err) return res.status(403).json({ error: 'Forbidden' });
+      if (!isSessionStillValid(user)) {
+        return res.status(401).json({ error: 'Oturumunuz sona erdi. Lütfen yeniden giriş yapın.' });
+      }
       req.user = user;
       next();
     });
   };
 
+  // Şifre (veya özel giriş anahtarı) değiştiğinde eski token'lar geçersiz olur.
+  function isSessionStillValid(user: any): boolean {
+    if (!user || typeof user !== 'object') return false;
+    if (user.role === 'superadmin') {
+      return user.kv === secretFingerprint(SUPER_ADMIN_KEY);
+    }
+    const row: any = db.prepare('SELECT role, kurumKodu, passwordHash FROM users WHERE id = ?').get(user.id);
+    if (!row || row.role !== user.role || row.kurumKodu !== user.kurumKodu) return false;
+    return user.pwv === secretFingerprint(row.passwordHash);
+  }
+
+  // Superadmin, seçili kurum kodu üzerinden okul verisine erişir.
+  const getEffectiveKurumKodu = (req: any): string => {
+    const { kurumKodu, role } = req.user;
+    if (role === 'superadmin') {
+      const acting = req.headers['x-acting-kurum-kodu'];
+      if (typeof acting === 'string' && acting.trim()) {
+        return acting.trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+      }
+    }
+    return kurumKodu;
+  };
+
+  const isAdminRole = (role: string) => role === 'admin' || role === 'superadmin';
+
+  // Öğretmen hesabı salt okunurdur; veri değiştiren uç noktalar yalnızca yöneticilere açıktır.
+  const requireAdmin = (req: any, res: any, next: any) => {
+    if (!req.user || !isAdminRole(req.user.role)) {
+      return res.status(403).json({ error: 'Bu işlem için yönetici yetkisi gerekir.' });
+    }
+    next();
+  };
+
+  // Gmail uygulama şifresi gibi gizli alanlar yönetici olmayanlara gönderilmez.
+  const redactForRole = (collection: string, data: any, role: string) => {
+    if (collection !== 'schoolInfo' || isAdminRole(role) || !data || typeof data !== 'object') return data;
+    const { gmailAppPassword, ...rest } = data;
+    return rest;
+  };
+
   // Middleware: aktif/geçerli lisans gerektir.
   // - superadmin için her zaman izinli.
-  // - DB'de hiç lisans kaydı olmayan eski kullanıcılar (geriye uyumluluk) izinli.
-  // - inactive / expired kullanıcılar 403 + licenseStatus alanı ile reddedilir.
+  // - Lisans kaydı olmayan eski kurulumlara süresiz bir kayıt açılır (süper yönetici sonradan yönetebilir).
+  // - Silinmiş, pasif veya süresi dolmuş lisanslar 403 + licenseStatus alanı ile reddedilir.
   // İstemci `licenseStatus` alanını görünce oturumu kapatıp uyarı gösterir.
   const requireActiveLicense = (req: any, res: any, next: any) => {
     if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
     if (req.user.role === 'superadmin') return next();
-    const lic = checkLicenseRecord(req.user.kurumKodu);
-    if (lic.ok || lic.reason === 'not-found') return next();
+    const lic = ensureLegacyLicense(req.user.kurumKodu);
+    if (lic.ok) return next();
     const msg =
       lic.reason === 'inactive'
         ? 'Lisansınız pasif duruma alınmış. Lütfen yöneticiyle iletişime geçin.'
@@ -484,10 +810,33 @@ async function startServer() {
     // Lisans anahtarı doğrulandıktan sonra lisans durumunu kontrol et.
     // not-found ise (okulun kendi lokal DB'sinde ilk kurulum), kaydı otomatik oluşturacağız.
     const lic = checkLicenseRecord(cleanKurumKodu);
+    const existingUser = db.prepare('SELECT id FROM users WHERE kurumKodu = ?').get(cleanKurumKodu);
+
+    // Daha önce kayıt olmuş okullar yeniden kayıt olamaz — sadece lisans uzatılır.
+    if (existingUser) {
+      if (!lic.ok && lic.reason === 'expired') {
+        return res.status(403).json({
+          error: 'Bu okul zaten kayıtlı; lisans süresi dolmuş. Yeniden kayıt gerekmez. Lisans uzatıldığında aynı kurum kodu, kullanıcı adı ve şifre ile giriş yapabilirsiniz.',
+          code: 'already-registered-expired',
+        });
+      }
+      if (!lic.ok && lic.reason === 'inactive') {
+        return res.status(403).json({
+          error: 'Bu okul zaten kayıtlı; lisans pasif. Yeniden kayıt gerekmez. Lisans yeniden etkinleştirildiğinde aynı şifrelerle giriş yapabilirsiniz.',
+          code: 'already-registered-inactive',
+        });
+      }
+      return res.status(400).json({
+        error: 'Bu kurum kodu ile zaten bir kayıt oluşturulmuş. Giriş sayfasından mevcut kullanıcı adı ve şifrenizle giriş yapın. Yeni lisans veya yeniden kayıt gerekmez.',
+        code: 'already-registered',
+      });
+    }
+
     if (!lic.ok && lic.reason !== 'not-found') {
       const msg =
-        lic.reason === 'inactive' ? 'Bu kurum kodu için lisans pasif durumda. Lütfen yöneticiyle iletişime geçin.' :
-        'Bu kurum kodu için lisansın süresi dolmuş. Lütfen yöneticiyle iletişime geçin.';
+        lic.reason === 'inactive'
+          ? 'Bu kurum kodu için lisans pasif durumda. Lütfen yöneticiyle iletişime geçin.'
+          : 'Bu kurum kodu için lisansın süresi dolmuş. Yönetici lisansı uzattıktan sonra ilk kurulumu tamamlayabilirsiniz.';
       return res.status(403).json({ error: msg });
     }
 
@@ -495,12 +844,6 @@ async function startServer() {
     const teacherEmail = `teacher@${cleanKurumKodu}.nobet.app`;
 
     try {
-      // Check if school already exists
-      const existingUser = db.prepare('SELECT id FROM users WHERE kurumKodu = ?').get(cleanKurumKodu);
-      if (existingUser) {
-        return res.status(400).json({ error: 'Bu kurum kodu ile zaten bir kayıt oluşturulmuş.' });
-      }
-
       const adminHash = bcrypt.hashSync(adminPassword, 10);
       const teacherHash = bcrypt.hashSync(teacherPassword, 10);
 
@@ -532,7 +875,7 @@ async function startServer() {
         const insertDoc = db.prepare('INSERT INTO documents (collection, id, kurumKodu, data) VALUES (?, ?, ?, ?)');
         const m = new Date().getMonth() + 1;
         const y = new Date().getFullYear();
-        const initYear = m >= 9 ? `${y}-${y + 1}` : `${y - 1}-${y}`;
+        const initYear = m >= 8 ? `${y}-${y + 1}` : `${y - 1}-${y}`;
         insertDoc.run('schoolInfo', 'info', cleanKurumKodu, JSON.stringify({
           valilik: '',
           kaymakamlik: '',
@@ -558,32 +901,45 @@ async function startServer() {
     if (!kurumKodu || !role || !password) {
       return res.status(400).json({ error: 'Missing fields' });
     }
+    if (role !== 'admin' && role !== 'teacher') {
+      return res.status(400).json({ error: 'Geçersiz kullanıcı türü.' });
+    }
 
-    const cleanKurumKodu = kurumKodu.trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    const cleanKurumKodu = String(kurumKodu).trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     const email = `${role}@${cleanKurumKodu}.nobet.app`;
+    const rateKey = authRateKey(req, 'login');
+    if (isAuthRateLimited(rateKey)) {
+      return res.status(429).json({ error: RATE_LIMIT_MESSAGE });
+    }
 
     try {
       const user: any = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-      if (!user) {
+      if (!user || user.role !== role) {
+        recordAuthFailure(rateKey);
         return res.status(401).json({ error: 'Hatalı kurum kodu, kullanıcı adı veya şifre.' });
       }
 
-      const validPassword = bcrypt.compareSync(password, user.passwordHash);
+      const validPassword = bcrypt.compareSync(String(password), user.passwordHash);
       if (!validPassword) {
+        recordAuthFailure(rateKey);
         return res.status(401).json({ error: 'Hatalı kurum kodu, kullanıcı adı veya şifre.' });
       }
 
-      // Lisans kontrolü: kayıt sırasında lisans olabilir ama daha sonra pasif edilmiş veya süresi geçmiş olabilir.
-      // Eski kullanıcılar için lisans kaydı yoksa engellemiyoruz (geriye dönük uyumluluk).
-      const lic = checkLicenseRecord(user.kurumKodu);
-      if (!lic.ok && lic.reason !== 'not-found') {
+      // Lisans kontrolü: kayıt sırasında lisans olabilir ama daha sonra pasif edilmiş, silinmiş veya süresi geçmiş olabilir.
+      const lic = ensureLegacyLicense(user.kurumKodu);
+      if (!lic.ok) {
         const msg =
-          lic.reason === 'inactive' ? 'Lisansınız pasif durumda. Lütfen yöneticiyle iletişime geçin.' :
-          'Lisansınızın süresi dolmuş. Lütfen yöneticiyle iletişime geçin.';
-        return res.status(403).json({ error: msg });
+          lic.reason === 'inactive'
+            ? 'Lisansınız pasif durumda. Yönetici lisansı yeniden etkinleştirdiğinde aynı kurum kodu, kullanıcı adı ve şifre ile giriş yapabilirsiniz. Yeniden kayıt gerekmez.'
+            : 'Lisansınızın süresi dolmuş. Yönetici lisansınızı uzattığında aynı kurum kodu, kullanıcı adı ve şifre ile giriş yapabilirsiniz. Yeniden kayıt veya yeni lisans gerekmez.';
+        return res.status(403).json({ error: msg, licenseStatus: lic.reason });
       }
 
-      const token = jwt.sign({ id: user.id, kurumKodu: user.kurumKodu, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+      const token = jwt.sign(
+        { id: user.id, kurumKodu: user.kurumKodu, role: user.role, pwv: secretFingerprint(user.passwordHash) },
+        JWT_SECRET,
+        { expiresIn: '7d' },
+      );
 
       // Lisans tablosunda lastLoginAt güncelle
       db.prepare('UPDATE licenses SET lastLoginAt = ? WHERE kurumKodu = ?').run(new Date().toISOString(), user.kurumKodu);
@@ -606,15 +962,28 @@ async function startServer() {
   // Auth: Özel Giriş
   app.post('/api/auth/superadmin-login', (req, res) => {
     const { masterKey } = req.body;
+    const rateKey = authRateKey(req, 'superadmin');
+    if (isAuthRateLimited(rateKey)) {
+      return res.status(429).json({ error: RATE_LIMIT_MESSAGE });
+    }
 
-    if (masterKey !== SUPER_ADMIN_KEY) {
+    if (!superAdminLoginAllowed(req)) {
+      recordAuthFailure(rateKey);
+      return res.status(403).json({
+        error: 'Özel giriş bu sunucuda yalnızca sunucu bilgisayarından yapılabilir. Uzaktan giriş için sunucuda SUPER_ADMIN_KEY ayarlanmalıdır.',
+      });
+    }
+
+    if (typeof masterKey !== 'string' || !safeEqual(masterKey, SUPER_ADMIN_KEY)) {
+      recordAuthFailure(rateKey);
       return res.status(401).json({ error: 'Geçersiz anahtar.' });
     }
 
-    const token = jwt.sign({ 
-      id: 'superadmin', 
-      kurumKodu: '__superadmin__', 
-      role: 'superadmin' 
+    const token = jwt.sign({
+      id: 'superadmin',
+      kurumKodu: '__superadmin__',
+      role: 'superadmin',
+      kv: secretFingerprint(SUPER_ADMIN_KEY),
     }, JWT_SECRET, { expiresIn: '7d' });
 
     res.json({
@@ -658,17 +1027,24 @@ async function startServer() {
     const licenseKey = generateLicenseKey(cleanKurumKodu);
 
     try {
-      // Zaten var mı kontrol et
-      const existing = db.prepare('SELECT id FROM licenses WHERE kurumKodu = ?').get(cleanKurumKodu);
+      // Zaten var mı kontrol et — kayıtlı okullar için yeni lisans değil, uzatma gerekir
+      const existing: any = db.prepare('SELECT * FROM licenses WHERE kurumKodu = ?').get(cleanKurumKodu);
       if (existing) {
-        return res.status(400).json({ error: 'Bu kurum kodu için zaten lisans mevcut.' });
+        return res.status(409).json({
+          error: 'Bu kurum kodu için zaten lisans mevcut. Yeni lisans oluşturmayın; mevcut lisansı uzatın. Okul aynı kullanıcı adı ve şifre ile giriş yapmaya devam eder.',
+          code: 'license-exists',
+          license: existing,
+        });
       }
 
       const id = uuidv4();
-      db.prepare(`
-        INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-      `).run(id, cleanKurumKodu, okulAdi.trim(), licenseKey, new Date().toISOString(), expiresAt || null);
+      db.transaction(() => {
+        db.prepare(`
+          INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive)
+          VALUES (?, ?, ?, ?, ?, ?, 1)
+        `).run(id, cleanKurumKodu, okulAdi.trim(), licenseKey, new Date().toISOString(), expiresAt || null);
+        setLicenseRevoked(cleanKurumKodu, false);
+      })();
 
       res.json({ 
         id, 
@@ -692,7 +1068,12 @@ async function startServer() {
     }
 
     try {
-      db.prepare('DELETE FROM licenses WHERE id = ?').run(req.params.id);
+      const license: any = db.prepare('SELECT kurumKodu FROM licenses WHERE id = ?').get(req.params.id);
+      db.transaction(() => {
+        db.prepare('DELETE FROM licenses WHERE id = ?').run(req.params.id);
+        // Silinen lisansın okulu, kaydı olmayan eski kurulum sayılıp girişe devam edemesin.
+        if (license?.kurumKodu) setLicenseRevoked(license.kurumKodu, true);
+      })();
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -728,7 +1109,8 @@ async function startServer() {
         nextOkul = okulAdi.trim();
       }
 
-      db.prepare('UPDATE licenses SET expiresAt = ?, okulAdi = ? WHERE id = ?').run(
+      // Uzatma / düzenleme sonrası okul aynı hesapla girebilsin diye lisansı yeniden aktif et.
+      db.prepare('UPDATE licenses SET expiresAt = ?, okulAdi = ?, isActive = 1 WHERE id = ?').run(
         nextExpires,
         nextOkul,
         req.params.id,
@@ -762,30 +1144,62 @@ async function startServer() {
     }
   });
 
-  // Auth: Reset Admin Password (forgot password)
+  // Auth: Şifre sıfırlama — lisans anahtarı ile doğrulanır.
+  // Yalnızca passwordHash güncellenir; kullanıcılar ve okul verileri dokunulmaz.
   app.post('/api/auth/reset-password', (req, res) => {
-    const { kurumKodu, newPassword } = req.body;
+    const { kurumKodu, licenseKey, newPassword, role: resetRole } = req.body;
 
-    if (!kurumKodu || !newPassword) {
-      return res.status(400).json({ error: 'Eksik alanlar.' });
+    if (!kurumKodu || !licenseKey || !newPassword) {
+      return res.status(400).json({ error: 'Kurum kodu, lisans anahtarı ve yeni şifre gerekli.' });
     }
     if (newPassword.length < 6) {
       return res.status(400).json({ error: 'Yeni şifre en az 6 karakter olmalıdır.' });
     }
 
-    const cleanKurumKodu = kurumKodu.trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-    const email = `admin@${cleanKurumKodu}.nobet.app`;
+    const targetRole = resetRole === 'teacher' ? 'teacher' : 'admin';
+    const cleanKurumKodu = String(kurumKodu).trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    const cleanLicense = String(licenseKey).replace(/[^a-zA-Z0-9]/g, '').trim().toUpperCase();
+    const rateKey = authRateKey(req, 'reset-password');
+    if (isAuthRateLimited(rateKey)) {
+      return res.status(429).json({ error: RATE_LIMIT_MESSAGE });
+    }
+
+    if (!validateLicenseKey(cleanKurumKodu, cleanLicense)) {
+      recordAuthFailure(rateKey);
+      return res.status(400).json({
+        error: 'Geçersiz lisans anahtarı. Size verilen lisans anahtarını kontrol edin.',
+      });
+    }
+
+    // Kurumun daha önce kayıtlı olduğundan emin ol (veri kaybı / yeniden kurulum yok)
+    const existingUsers = db.prepare('SELECT id FROM users WHERE kurumKodu = ? LIMIT 1').get(cleanKurumKodu);
+    if (!existingUsers) {
+      return res.status(404).json({
+        error: 'Bu kurum koduna ait kayıt bulunamadı. Henüz ilk kurulumu yapmadıysanız “Yeni Okul Kaydı”nı kullanın.',
+      });
+    }
+
+    const email = `${targetRole}@${cleanKurumKodu}.nobet.app`;
 
     try {
-      const user: any = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+      const user: any = db.prepare('SELECT id, email FROM users WHERE email = ?').get(email);
       if (!user) {
-        return res.status(404).json({ error: 'Bu kurum koduna ait kayıt bulunamadı.' });
+        return res.status(404).json({
+          error: targetRole === 'admin'
+            ? 'Bu kurum için admin hesabı bulunamadı.'
+            : 'Bu kurum için öğretmen hesabı bulunamadı.',
+        });
       }
 
       const newHash = bcrypt.hashSync(newPassword, 10);
+      // Sadece şifre hash'i — documents / diğer kullanıcılar silinmez
       db.prepare('UPDATE users SET passwordHash = ? WHERE email = ?').run(newHash, email);
 
-      res.json({ success: true });
+      res.json({
+        success: true,
+        role: targetRole,
+        message: 'Şifre güncellendi. Okul verileriniz aynen duruyor; yeni şifrenizle giriş yapabilirsiniz.',
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Şifre sıfırlanırken bir hata oluştu.' });
@@ -796,17 +1210,24 @@ async function startServer() {
   app.post('/api/auth/change-password', authenticateToken, requireActiveLicense, (req: any, res) => {
     const { targetRole, currentPassword, newPassword } = req.body;
 
-    if (req.user.role !== 'admin') {
+    if (!isAdminRole(req.user.role)) {
       return res.status(403).json({ error: 'Yalnızca admin şifre değiştirebilir.' });
     }
     if (!targetRole || !newPassword) {
       return res.status(400).json({ error: 'Eksik alanlar.' });
     }
+    if (targetRole !== 'admin' && targetRole !== 'teacher') {
+      return res.status(400).json({ error: 'Geçersiz kullanıcı türü.' });
+    }
+    // Süper yönetici dışındaki kullanıcılar admin şifresini mevcut şifreyi bilmeden değiştiremez.
+    if (targetRole === 'admin' && req.user.role !== 'superadmin' && !currentPassword) {
+      return res.status(400).json({ error: 'Mevcut admin şifresini girin.' });
+    }
     if (newPassword.length < 6) {
       return res.status(400).json({ error: 'Yeni şifre en az 6 karakter olmalıdır.' });
     }
 
-    const { kurumKodu } = req.user;
+    const kurumKodu = getEffectiveKurumKodu(req);
     const email = `${targetRole}@${kurumKodu}.nobet.app`;
 
     try {
@@ -825,7 +1246,15 @@ async function startServer() {
       const newHash = bcrypt.hashSync(newPassword, 10);
       db.prepare('UPDATE users SET passwordHash = ? WHERE email = ?').run(newHash, email);
 
-      res.json({ success: true });
+      // Eski şifreyle açılmış oturumlar kapanır; şifreyi değiştiren kendi hesabıysa oturumu yeni token ile sürer.
+      const token = user.id === req.user.id
+        ? jwt.sign(
+            { id: user.id, kurumKodu: user.kurumKodu, role: user.role, pwv: secretFingerprint(newHash) },
+            JWT_SECRET,
+            { expiresIn: '7d' },
+          )
+        : undefined;
+      res.json({ success: true, ...(token ? { token } : {}) });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Şifre değiştirilirken bir hata oluştu.' });
@@ -833,7 +1262,7 @@ async function startServer() {
   });
 
   // Auth: Me
-  app.get('/api/auth/me', authenticateToken, (req: any, res) => {
+  app.get('/api/auth/me', authenticateToken, requireActiveLicense, (req: any, res) => {
     const isSuper = req.user.role === 'superadmin';
     res.json({
       user: {
@@ -854,17 +1283,76 @@ async function startServer() {
     });
   });
 
+  // Public: MEB eğitim-öğretim yılı takvimini resmi haber sayfasından çeker
+  app.get('/api/meb-calendar/:year', async (req, res) => {
+    const academicYear = String(req.params.year || '').trim();
+    if (!/^\d{4}-\d{4}$/.test(academicYear)) {
+      return res.status(400).json({ ok: false, error: 'Geçersiz eğitim-öğretim yılı.' });
+    }
+
+    try {
+      const urls = resolveMebCalendarUrls(academicYear);
+      let lastError: string | null = null;
+
+      for (const url of urls) {
+        try {
+          const upstream = await fetch(url, {
+            headers: {
+              'user-agent': 'OkulNobetProgrami/1.0 (+https://localhost; MEB takvim senkronu)',
+              accept: 'text/html,application/xhtml+xml',
+            },
+            redirect: 'follow',
+          });
+          if (!upstream.ok) {
+            lastError = `HTTP ${upstream.status}`;
+            continue;
+          }
+          const html = await upstream.text();
+          const parsed = parseMebCalendarHtml(html, academicYear, url);
+          if (!parsed || parsed.holidays.length === 0) {
+            lastError = 'Sayfada tatil tarihi bulunamadı';
+            continue;
+          }
+          return res.json({
+            ok: true,
+            academicYear: parsed.academicYear,
+            title: parsed.title,
+            holidays: parsed.holidays,
+            contentHash: parsed.contentHash,
+            sourceUrl: parsed.sourceUrl,
+            fetchedAt: new Date().toISOString(),
+          });
+        } catch (err: any) {
+          lastError = err?.message || String(err);
+        }
+      }
+
+      return res.status(404).json({
+        ok: false,
+        error: lastError || 'MEB takvim sayfası bulunamadı.',
+        academicYear,
+      });
+    } catch (err: any) {
+      console.warn('[meb-calendar] hata:', err);
+      return res.status(500).json({ ok: false, error: 'MEB takvimi alınamadı.' });
+    }
+  });
+
   // Lisans: Bir kurum kodu için aktif lisans kontrolü (kayıt formunda canlı geri bildirim için)
   app.get('/api/licenses/check/:kurumKodu', (req, res) => {
     const cleanKurumKodu = req.params.kurumKodu.trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-    if (!cleanKurumKodu) return res.json({ exists: false });
+    if (!cleanKurumKodu) return res.json({ exists: false, registered: false });
     const lic = checkLicenseRecord(cleanKurumKodu);
+    const registered = !!db.prepare('SELECT id FROM users WHERE kurumKodu = ? LIMIT 1').get(cleanKurumKodu);
+    // not-found iken lic.license yok; satır yine de olabilir mi? hayır.
+    const row: any = lic.license || db.prepare('SELECT * FROM licenses WHERE kurumKodu = ?').get(cleanKurumKodu);
     res.json({
-      exists: !!lic.license,
+      exists: !!row,
+      registered,
       ok: lic.ok,
       reason: lic.reason || null,
-      okulAdi: lic.license?.okulAdi || null,
-      expiresAt: lic.license?.expiresAt || null,
+      okulAdi: row?.okulAdi || null,
+      expiresAt: row?.expiresAt || null,
     });
   });
 
@@ -919,13 +1407,14 @@ async function startServer() {
   // CRUD: Get Collection
   app.get('/api/data/:collection', authenticateToken, requireActiveLicense, (req: any, res) => {
     const { collection } = req.params;
-    const { kurumKodu } = req.user;
+    const kurumKodu = getEffectiveKurumKodu(req);
 
     try {
       const rows = db.prepare('SELECT id, data FROM documents WHERE collection = ? AND kurumKodu = ?').all(collection, kurumKodu);
       const items = rows.map((row: any) => ({
         id: row.id,
-        ...JSON.parse(row.data)
+        ...redactForRole(collection, JSON.parse(row.data), req.user.role),
+        _rev: revisionOf(row.data),
       }));
       res.json(items);
     } catch (err) {
@@ -935,19 +1424,21 @@ async function startServer() {
   });
 
   // CRUD: Create Document
-  app.post('/api/data/:collection', authenticateToken, requireActiveLicense, (req: any, res) => {
+  app.post('/api/data/:collection', authenticateToken, requireActiveLicense, requireAdmin, (req: any, res) => {
     const { collection } = req.params;
-    const { kurumKodu } = req.user;
-    const data = req.body;
+    const kurumKodu = getEffectiveKurumKodu(req);
+    const data = stripRevision(req.body);
     
     // Use provided id or generate one
     const id = data.id || uuidv4();
     if (!data.id) data.id = id;
 
     try {
+      const json = JSON.stringify(data);
       db.prepare('INSERT INTO documents (collection, id, kurumKodu, data) VALUES (?, ?, ?, ?)').run(
-        collection, id, kurumKodu, JSON.stringify(data)
+        collection, id, kurumKodu, json
       );
+      res.setHeader('X-Rev', revisionOf(json));
       res.json(data);
     } catch (err) {
       console.error(err);
@@ -956,22 +1447,43 @@ async function startServer() {
   });
 
   // CRUD: Update Document
-  app.put('/api/data/:collection/:id', authenticateToken, requireActiveLicense, (req: any, res) => {
+  app.put('/api/data/:collection/:id', authenticateToken, requireActiveLicense, requireAdmin, (req: any, res) => {
     const { collection, id } = req.params;
-    const { kurumKodu } = req.user;
-    const data = req.body;
+    const kurumKodu = getEffectiveKurumKodu(req);
+    const data = stripRevision(req.body);
+    const ifMatch = typeof req.headers['if-match'] === 'string' ? req.headers['if-match'] : '';
 
     try {
-      const result = db.prepare('UPDATE documents SET data = ? WHERE collection = ? AND id = ? AND kurumKodu = ?').run(
-        JSON.stringify(data), collection, id, kurumKodu
-      );
-      
-      if (result.changes === 0) {
-        // If it doesn't exist, insert it (upsert behavior)
-        db.prepare('INSERT INTO documents (collection, id, kurumKodu, data) VALUES (?, ?, ?, ?)').run(
-          collection, id, kurumKodu, JSON.stringify(data)
+      const json = JSON.stringify(data);
+      // Okuma-karşılaştırma-yazma tek işlemde: arada başka bir yazma araya giremez.
+      const outcome = db.transaction(() => {
+        const current: any = db.prepare('SELECT data FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').get(
+          collection, id, kurumKodu
         );
+        // İstemci okuduğu sürümü bildirdiyse ve kayıt o arada başka yerden değiştiyse üzerine yazılmaz.
+        if (current && ifMatch && revisionOf(current.data) !== ifMatch) {
+          return { conflict: true as const, current: current.data as string };
+        }
+        if (current) {
+          db.prepare('UPDATE documents SET data = ? WHERE collection = ? AND id = ? AND kurumKodu = ?').run(
+            json, collection, id, kurumKodu
+          );
+        } else {
+          db.prepare('INSERT INTO documents (collection, id, kurumKodu, data) VALUES (?, ?, ?, ?)').run(
+            collection, id, kurumKodu, json
+          );
+        }
+        return { conflict: false as const };
+      })();
+
+      if (outcome.conflict) {
+        return res.status(409).json({
+          error: 'Bu kayıt başka bir yerde değiştirilmiş.',
+          current: redactForRole(collection, JSON.parse(outcome.current), req.user.role),
+          rev: revisionOf(outcome.current),
+        });
       }
+      res.setHeader('X-Rev', revisionOf(json));
       res.json(data);
     } catch (err) {
       console.error(err);
@@ -980,9 +1492,9 @@ async function startServer() {
   });
 
   // CRUD: Delete Document
-  app.delete('/api/data/:collection/:id', authenticateToken, requireActiveLicense, (req: any, res) => {
+  app.delete('/api/data/:collection/:id', authenticateToken, requireActiveLicense, requireAdmin, (req: any, res) => {
     const { collection, id } = req.params;
-    const { kurumKodu } = req.user;
+    const kurumKodu = getEffectiveKurumKodu(req);
 
     try {
       db.prepare('DELETE FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').run(
@@ -998,7 +1510,7 @@ async function startServer() {
   // CRUD: Get Single Document
   app.get('/api/doc/:collection/:id', authenticateToken, requireActiveLicense, (req: any, res) => {
     const { collection, id } = req.params;
-    const { kurumKodu } = req.user;
+    const kurumKodu = getEffectiveKurumKodu(req);
 
     try {
       const row: any = db.prepare('SELECT data FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').get(
@@ -1006,7 +1518,8 @@ async function startServer() {
       );
       
       if (row) {
-        res.json(JSON.parse(row.data));
+        res.setHeader('X-Rev', revisionOf(row.data));
+        res.json(redactForRole(collection, JSON.parse(row.data), req.user.role));
       } else {
         res.status(404).json({ error: 'Document not found' });
       }
@@ -1018,9 +1531,9 @@ async function startServer() {
 
   // Email: Send notifications to teachers
   app.post('/api/send-email', authenticateToken, requireActiveLicense, async (req: any, res) => {
-    const { kurumKodu } = req.user;
+    const kurumKodu = getEffectiveKurumKodu(req);
 
-    if (req.user.role !== 'admin') {
+    if (!isAdminRole(req.user.role)) {
       return res.status(403).json({ error: 'Yalnızca admin e-posta gönderebilir.' });
     }
 
@@ -1084,6 +1597,84 @@ async function startServer() {
     }
   });
 
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  // --- Eski bilgisayarlardaki verileri bu sunucuya taşıma ---
+  const rawDatabase = express.raw({ type: 'application/octet-stream', limit: '200mb' });
+
+  app.post('/api/migrate/superadmin-import', authenticateToken, rawDatabase, (req: any, res) => {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Yetkisiz erişim.' });
+    }
+    try {
+      const counts = withUploadedDatabase(req.body, file => importDatabaseFile(file));
+      res.json({ ok: true, ...counts });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Veritabanı içe aktarılamadı.' });
+    }
+  });
+
+  // Kurum yöneticisi, eski bilgisayarındaki veritabanını kurum kodu ve yönetici şifresiyle yükler.
+  // Şifre dosyadaki kayıtla doğrulanır; yalnızca o kurumun satırları alınır.
+  app.post('/api/migrate/kurum-import', rawDatabase, (req, res) => {
+    const rateKey = authRateKey(req, 'migrate');
+    if (isAuthRateLimited(rateKey)) {
+      return res.status(429).json({ error: RATE_LIMIT_MESSAGE });
+    }
+    const kurumKodu = String(req.headers['x-kurum-kodu'] || '').trim().replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    let password = '';
+    try { password = decodeURIComponent(String(req.headers['x-admin-password'] || '')); } catch { /* boş kalır */ }
+    if (!kurumKodu || !password) {
+      return res.status(400).json({ error: 'Kurum kodu ve yönetici şifresi gerekli.' });
+    }
+
+    const authError = (message: string) => Object.assign(new Error(message), { status: 401 });
+    try {
+      const counts = withUploadedDatabase(req.body, file => {
+        const src = new Database(file, { readonly: true, fileMustExist: true });
+        try {
+          const tables = new Set(
+            (src.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map(t => t.name),
+          );
+          if (!tables.has('users')) throw new Error('Dosyada kullanıcı bilgisi yok.');
+          const email = `admin@${kurumKodu}.nobet.app`;
+          const localUser: any = src.prepare('SELECT * FROM users WHERE email = ?').get(email);
+          if (!localUser || !bcrypt.compareSync(password, localUser.passwordHash)) {
+            throw authError('Dosyada bu kurum kodu ve yönetici şifresiyle eşleşen kayıt bulunamadı.');
+          }
+          const cloudUser: any = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+          if (cloudUser && !bcrypt.compareSync(password, cloudUser.passwordHash)) {
+            throw authError('Bu kurum sunucuda farklı bir yönetici şifresiyle kayıtlı. Sunucudaki şifreyi kullanın.');
+          }
+          if (isLicenseRevoked(kurumKodu)) {
+            throw Object.assign(new Error('Bu kurumun lisansı kaldırılmış. Lütfen yöneticiyle iletişime geçin.'), { status: 403 });
+          }
+          const cloudLicense = db.prepare('SELECT kurumKodu FROM licenses WHERE kurumKodu = ?').get(kurumKodu);
+          const localLicense: any = tables.has('licenses')
+            ? src.prepare('SELECT licenseKey FROM licenses WHERE kurumKodu = ?').get(kurumKodu)
+            : null;
+          const hasValidLocalKey = !!(localLicense && validateLicenseKey(kurumKodu, localLicense.licenseKey));
+          if (!cloudLicense && !hasValidLocalKey) {
+            throw new Error('Bu kurum için geçerli bir lisans bulunamadı.');
+          }
+          // Sunucuda henüz yönetici yoksa dosyanın lisans anahtarı kayıttaki gibi kanıt olarak istenir.
+          if (!cloudUser && !hasValidLocalKey) {
+            throw authError('Bu kurum sunucuda henüz kayıtlı değil; dosyada geçerli lisans anahtarı bulunamadı.');
+          }
+        } finally {
+          src.close();
+        }
+        return importDatabaseFile(file, kurumKodu);
+      });
+      res.json({ ok: true, ...counts });
+    } catch (err: any) {
+      if (err?.status === 401) recordAuthFailure(rateKey);
+      res.status(err?.status || 400).json({ error: err instanceof Error ? err.message : 'Veritabanı içe aktarılamadı.' });
+    }
+  });
+
   // Vite middleware for development (sadece geliştirme modunda dinamik import)
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import('vite');
@@ -1100,9 +1691,21 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[server] ${PORT} portu kullanımda. Uygulamanın başka bir kopyası açık olabilir.`);
+    } else {
+      console.error('[server] Sunucu hatası:', err);
+    }
+    process.exit(1);
+  });
+  startCloudBackups();
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[server] Sunucu başlatılamadı:', err);
+  process.exit(1);
+});

@@ -86,13 +86,35 @@ export function fuzzyTeacherMatch(fullName: string, abbreviated: string): boolea
   return false;
 }
 
-/** İki ismin aynı kişiye ait olup olmadığını döner (her iki yönde fuzzy dahil). */
+function nameTokens(name: string): string[] {
+  return turkishLower((name || '').trim()).replace(/\./g, '. ').split(/\s+/).filter(Boolean);
+}
+
+/** "A. Yılmaz", "Ah.Yılmaz", "A Yılmaz" gibi açıkça kısaltılmış bir parça içeriyor mu? */
+function hasAbbreviation(name: string): boolean {
+  return nameTokens(name).some((p) => p.endsWith('.') || p.length === 1);
+}
+
+/**
+ * İki ismin aynı kişiye ait olup olmadığını döner.
+ * Birebir eşleşme dışında, isimlerden biri açık bir kısaltma içermelidir;
+ * aksi halde "Can Demir" / "Canan Demir" gibi farklı kişiler eşleşirdi.
+ */
 export function isSameTeacherName(a: string, b: string): boolean {
   const la = turkishLower((a || '').trim());
   const lb = turkishLower((b || '').trim());
   if (!la || !lb) return false;
   if (la === lb) return true;
-  return fuzzyTeacherMatch(a, b) || fuzzyTeacherMatch(b, a);
+  if (hasAbbreviation(b) && fuzzyTeacherMatch(a, b)) return true;
+  if (hasAbbreviation(a) && fuzzyTeacherMatch(b, a)) return true;
+  return false;
+}
+
+/** Onay sorulmadan yapılan birleştirme için daha sıkı kural: parça sayısı da aynı olmalı. */
+function isSafeAutoMergeName(a: string, b: string): boolean {
+  if (!isSameTeacherName(a, b)) return false;
+  if (turkishLower(a.trim()) === turkishLower(b.trim())) return true;
+  return nameTokens(a).length === nameTokens(b).length;
 }
 
 /** Bir ismin "tam ad" puanı: ne kadar uzun ve kısaltma içermiyorsa o kadar yüksek. */
@@ -197,6 +219,7 @@ export function mergeTwoTeachers(primary: Teacher, secondary: Teacher): Teacher 
           ? 'hareketli'
           : primary.dutyType || secondary.dutyType || 'sabit',
     unavailableDays,
+    preferredDay: primary.preferredDay ?? secondary.preferredDay,
     availableDays,
   };
 }
@@ -215,8 +238,22 @@ export function unifyTeachers(list: Teacher[]): {
   const idRemap: Record<string, string> = {};
   const out: Teacher[] = [];
 
+  // "A. Yılmaz" birden fazla farklı tam adla eşleşiyorsa hangisi olduğu belli değildir; birleştirme.
+  const ambiguous = new Set<string>();
   for (const t of list) {
-    const j = out.findIndex((o) => isSameTeacherName(o.name, t.name));
+    if (!hasAbbreviation(t.name)) continue;
+    const candidates = new Set(
+      list
+        .filter((o) => o.id !== t.id && !hasAbbreviation(o.name) && isSafeAutoMergeName(o.name, t.name))
+        .map((o) => turkishLower(o.name.trim())),
+    );
+    if (candidates.size > 1) ambiguous.add(t.id);
+  }
+
+  for (const t of list) {
+    const j = ambiguous.has(t.id)
+      ? -1
+      : out.findIndex((o) => !ambiguous.has(o.id) && isSafeAutoMergeName(o.name, t.name));
     if (j < 0) {
       out.push({ ...t });
       continue;

@@ -1,13 +1,16 @@
 {
   "name": "okul-nobet-programi",
   "private": true,
-  "version": "1.9.2",
+  "version": "1.15.0",
   "description": "Okul Nöbet Programı",
   "author": {
     "name": "Hidayet SEVDİ"
   },
   "type": "module",
   "main": "electron/main.js",
+  "okulNobet": {
+    "cloudUrl": ""
+  },
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node --experimental-strip-types server.ts",
@@ -15,6 +18,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "electron:dev": "cross-env NODE_ENV=development concurrently \"npm run dev\" \"wait-on tcp:3000 && electron .\"",
     "electron:build": "npm run build && electron-builder",
     "build:desktop": "node scripts/build-desktop.mjs"
@@ -39,11 +44,11 @@
     ],
     "extraFiles": [
       {
-        "from": "release/OkulNobet.exe",
+        "from": "out/OkulNobet.exe",
         "to": "OkulNobet.exe"
       },
       {
-        "from": "release/better_sqlite3.node",
+        "from": "out/better_sqlite3.node",
         "to": "better_sqlite3.node"
       },
       {
@@ -100,6 +105,7 @@
     "date-fns": "^4.1.0",
     "dotenv": "^17.2.3",
     "electron-updater": "^6.8.3",
+    "exceljs": "^4.4.0",
     "express": "^4.21.2",
     "firebase": "^12.10.0",
     "jsonwebtoken": "^9.0.3",
@@ -131,6 +137,7 @@
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0",
+    "vitest": "^4.1.9",
     "wait-on": "^9.0.4"
   }
 }

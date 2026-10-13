@@ -1,66 +1,57 @@
-import React, { useState, useRef } from 'react';
-import { Plus, Trash2, MapPin, UserPlus, X, ChevronDown, GripVertical } from 'lucide-react';
+import React, { useState, useRef, useMemo } from 'react';
+import { Trash2, MapPin, ChevronDown, GripVertical, Plus, UserPlus, X, Copy } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
-import { Location, LocationDuty, Teacher } from '../types';
-
-const DAYS = [
-  { id: 1, label: 'Pazartesi', short: 'Pzt' },
-  { id: 2, label: 'Salı', short: 'Sal' },
-  { id: 3, label: 'Çarşamba', short: 'Çar' },
-  { id: 4, label: 'Perşembe', short: 'Per' },
-  { id: 5, label: 'Cuma', short: 'Cum' },
-];
+import { Location, Teacher, sortLocationsByOrder } from '../types';
+import { describeDailyDuty, getWeeklyDutyCount, maxDailyDuties } from '../lib/weeklyQuota';
 
 interface Props {
   locations: Location[];
   setLocations: React.Dispatch<React.SetStateAction<Location[]>>;
+  /** Silinen nöbet yerlerinin çizelgedeki nöbetlerini temizler. */
+  onLocationsRemoved?: (ids: string[]) => void;
   teachers: Teacher[];
+  /** Haftada kaç gün nöbet tutulduğu (okul günleri) */
+  schoolDayCount?: number;
 }
 
-export default function LocationsTab({ locations, setLocations, teachers }: Props) {
+export default function LocationsTab({ locations, setLocations, onLocationsRemoved, teachers, schoolDayCount = 5 }: Props) {
   const [newLocationName, setNewLocationName] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const dragOverId = useRef<string | null>(null);
-  
-  // Gün değiştirme modal state'i
-  const [editingDuty, setEditingDuty] = useState<{
-    locationId: string;
-    teacherId: string;
-    currentDay: number;
-  } | null>(null);
 
   const eligibleTeachers = teachers.filter(t => t.dutyType !== 'nobetDisi');
-  
-  const handleChangeDutyDay = (locationId: string, teacherId: string, oldDay: number, newDay: number) => {
-    if (oldDay === newDay) {
-      setEditingDuty(null);
-      return;
-    }
+
+  const teacherById = new Map(teachers.map(t => [t.id, t]));
+
+  const sortedLocations = useMemo(() => sortLocationsByOrder(locations), [locations]);
+
+  const assignedLocationsOf = (teacherId: string): Location[] =>
+    sortedLocations.filter(loc => (loc.assignedTeacherIds || []).includes(teacherId));
+
+  const handleAssignTeacher = (locationId: string, teacherId: string) => {
+    if (!teacherId) return;
     setLocations(prev => prev.map(loc => {
       if (loc.id !== locationId) return loc;
-      // Yeni günde 3 kişi varsa izin verme
-      const sameDayCount = loc.duties.filter(d => d.day === newDay).length;
-      if (sameDayCount >= 3) {
-        alert('Bu günde zaten 3 nöbetçi var!');
-        return loc;
-      }
-      // Aynı öğretmen aynı günde zaten varsa izin verme
-      if (loc.duties.some(d => d.teacherId === teacherId && d.day === newDay)) {
-        alert('Bu öğretmen zaten bu günde nöbetçi!');
-        return loc;
-      }
-      // Eski kaydı güncelle
-      return {
-        ...loc,
-        duties: loc.duties.map(d => 
-          d.teacherId === teacherId && d.day === oldDay 
-            ? { ...d, day: newDay } 
-            : d
-        ),
-      };
+      const current = loc.assignedTeacherIds || [];
+      if (current.includes(teacherId)) return loc;
+      return { ...loc, assignedTeacherIds: [...current, teacherId] };
     }));
-    setEditingDuty(null);
+  };
+
+  const handleUnassignTeacher = (locationId: string, teacherId: string) => {
+    setLocations(prev => prev.map(loc => {
+      if (loc.id !== locationId) return loc;
+      return { ...loc, assignedTeacherIds: (loc.assignedTeacherIds || []).filter(id => id !== teacherId) };
+    }));
+  };
+  
+  const handleChangeWeeklyDutyCount = (locationId: string, newCount: number) => {
+    if (newCount < 0 || newCount > 10) return; // Mantıklı bir sınır
+    setLocations(prev => prev.map(loc => {
+      if (loc.id !== locationId) return loc;
+      return { ...loc, weeklyDutyCount: newCount };
+    }));
   };
 
   const handleDragStart = (e: React.DragEvent, id: string) => {
@@ -76,13 +67,16 @@ export default function LocationsTab({ locations, setLocations, teachers }: Prop
   const handleDragEnd = () => {
     if (draggedId && dragOverId.current && draggedId !== dragOverId.current) {
       setLocations(prev => {
-        const fromIdx = prev.findIndex(l => l.id === draggedId);
-        const toIdx = prev.findIndex(l => l.id === dragOverId.current);
+        // Ekranda görünen sıra "order" alanına göredir; sunucudan gelen dizi sırası farklı olabilir.
+        const ordered = sortLocationsByOrder(prev);
+        const fromIdx = ordered.findIndex(l => l.id === draggedId);
+        const toIdx = ordered.findIndex(l => l.id === dragOverId.current);
         if (fromIdx < 0 || toIdx < 0) return prev;
-        const newList = [...prev];
+        const newList = [...ordered];
         const [moved] = newList.splice(fromIdx, 1);
         newList.splice(toIdx, 0, moved);
-        return newList;
+        // Order alanlarını güncelle
+        return newList.map((loc, idx) => ({ ...loc, order: idx }));
       });
     }
     setDraggedId(null);
@@ -97,49 +91,28 @@ export default function LocationsTab({ locations, setLocations, teachers }: Prop
       id: uuidv4(),
       name: newLocationName.trim(),
       duties: [],
+      weeklyDutyCount: 1, // Varsayılan olarak haftada 1 nöbetçi
     };
 
-    setLocations([...locations, newLocation]);
+    // Sıra numarası olmayan eski kayıtlar da numaralanır; yeni yer her zaman sona eklenir.
+    setLocations(prev => [
+      ...sortLocationsByOrder(prev).map((loc, idx) => (loc.order === idx ? loc : { ...loc, order: idx })),
+      { ...newLocation, order: prev.length },
+    ]);
     setNewLocationName('');
     setExpandedId(newLocation.id);
   };
 
-  const handleDeleteLocation = (id: string) => {
-    setLocations(locations.filter((l) => l.id !== id));
-    if (expandedId === id) setExpandedId(null);
+  const handleDeleteLocation = (location: Location) => {
+    if (!confirm(`"${location.name}" nöbet yeri silinsin mi? Mevcut çizelgedeki bu yere ait nöbetler de silinir.`)) return;
+    setLocations(prev => prev.filter((l) => l.id !== location.id));
+    onLocationsRemoved?.([location.id]);
+    if (expandedId === location.id) setExpandedId(null);
   };
 
-  const handleAddDuty = (locationId: string, teacherId: string, day: number) => {
-    setLocations(prev => prev.map(loc => {
-      if (loc.id !== locationId) return loc;
-      const sameDayCount = loc.duties.filter(d => d.day === day).length;
-      if (sameDayCount >= 3) return loc;
-      if (loc.duties.some(d => d.teacherId === teacherId && d.day === day)) return loc;
-      return { ...loc, duties: [...loc.duties, { teacherId, day }] };
-    }));
-  };
 
-  const handleRemoveDuty = (locationId: string, teacherId: string, day: number) => {
-    setLocations(prev => prev.map(loc => {
-      if (loc.id !== locationId) return loc;
-      return {
-        ...loc,
-        duties: loc.duties.filter(d => !(d.teacherId === teacherId && d.day === day)),
-      };
-    }));
-  };
 
-  const getTeacherName = (teacherId: string) => {
-    return teachers.find(t => t.id === teacherId)?.name || 'Bilinmeyen';
-  };
 
-  const getDayLabel = (day: number) => {
-    return DAYS.find(d => d.id === day)?.label || '';
-  };
-
-  const getDayShort = (day: number) => {
-    return DAYS.find(d => d.id === day)?.short || '';
-  };
 
   return (
     <div className="space-y-6">
@@ -166,27 +139,25 @@ export default function LocationsTab({ locations, setLocations, teachers }: Prop
 
       <div className="bg-surface rounded-xl shadow-sm border border-slate-200 overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/50">
-          <h2 className="text-lg font-semibold">Kayıtlı Nöbet Yerleri ({locations.length})</h2>
-          <p className="text-sm text-slate-500 mt-1">Her nöbet yerine aynı gün için en fazla 3 kişi atanabilir.</p>
+          <h2 className="text-lg font-semibold">Kayıtlı Nöbet Yerleri ({sortedLocations.length})</h2>
+          <p className="text-sm text-slate-500 mt-1">Her nöbet yeri için haftada toplam kaç nöbetçi tutulacağını belirleyin. (Örn: {schoolDayCount} ise her gün 1 kişi)</p>
         </div>
 
-        {locations.length === 0 ? (
+        {sortedLocations.length === 0 ? (
           <div className="p-8 text-center text-slate-500">
             Henüz nöbet yeri eklenmemiş.
           </div>
         ) : (
           <div className="divide-y divide-slate-200">
-            {locations.map((location) => {
+            {sortedLocations.map((location) => {
               const isExpanded = expandedId === location.id;
-              const duties = location.duties || [];
-              const dutyCount = duties.length;
+              const weeklyDutyCount = getWeeklyDutyCount(location);
               const isDragging = draggedId === location.id;
-
-              const dutiesByDay = new Map<number, LocationDuty[]>();
-              for (const d of duties) {
-                if (!dutiesByDay.has(d.day)) dutiesByDay.set(d.day, []);
-                dutiesByDay.get(d.day)!.push(d);
-              }
+              const assignedIds = (location.assignedTeacherIds || []).filter(id => teacherById.has(id));
+              const assignedCount = assignedIds.length;
+              const doubleCount = assignedIds.filter(id => assignedLocationsOf(id).length > 1).length;
+              const dailyDutyLabel = describeDailyDuty(weeklyDutyCount, schoolDayCount);
+              const dailyDutyCount = maxDailyDuties(weeklyDutyCount, schoolDayCount);
 
               return (
                 <div
@@ -213,28 +184,28 @@ export default function LocationsTab({ locations, setLocations, teachers }: Prop
                       </div>
                       <div className="min-w-0">
                         <span className="font-medium text-slate-700 block">{location.name}</span>
-                        {dutyCount > 0 ? (
-                          <div className="flex flex-wrap gap-1.5 mt-1">
-                            {duties.map((duty, i) => (
-                              <span key={i} className="text-xs bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full">
-                                {getTeacherName(duty.teacherId)} - {getDayShort(duty.day)}
-                              </span>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="text-xs text-amber-600">Henüz görevli atanmadı</span>
-                        )}
+                        <span className="text-xs text-indigo-600">Haftada {weeklyDutyCount} nöbetçi ({dailyDutyLabel})</span>
                       </div>
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
-                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                        dutyCount > 0 ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-500'
-                      }`}>
-                        {dutyCount} görev
+                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${assignedCount > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                        {assignedCount} öğretmen
+                      </span>
+                      {doubleCount > 0 && (
+                        <span
+                          className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800"
+                          title="Başka bir nöbet yerinde de atanmış öğretmen sayısı"
+                        >
+                          <Copy className="w-3 h-3" />
+                          {doubleCount} çift
+                        </span>
+                      )}
+                      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700`}>
+                        {weeklyDutyCount}/hafta
                       </span>
                       <ChevronDown className={`w-5 h-5 text-slate-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
                       <button
-                        onClick={(e) => { e.stopPropagation(); handleDeleteLocation(location.id); }}
+                        onClick={(e) => { e.stopPropagation(); handleDeleteLocation(location); }}
                         className="text-red-500 hover:text-red-700 p-2 rounded-lg hover:bg-red-50 transition-colors"
                         title="Sil"
                       >
@@ -245,57 +216,135 @@ export default function LocationsTab({ locations, setLocations, teachers }: Prop
 
                   {isExpanded && (
                     <div className="px-6 pb-5 bg-slate-50/50">
-                      {/* Günlere göre gruplanmış görevliler */}
-                      {duties.length > 0 && (
-                        <div className="space-y-3 mb-4">
-                          <h4 className="text-sm font-medium text-slate-600">Atanmış Görevliler</h4>
-                          {DAYS.filter(day => dutiesByDay.has(day.id)).map(day => {
-                            const dayDuties = dutiesByDay.get(day.id)!;
-                            return (
-                              <div key={day.id} className="bg-surface rounded-lg border border-slate-200 overflow-hidden">
-                                <div className="px-3 py-1.5 bg-slate-100 border-b border-slate-200 flex items-center justify-between">
-                                  <span className="text-xs font-semibold text-slate-600">{day.label}</span>
-                                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                                    dayDuties.length >= 3 ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'
-                                  }`}>
-                                    {dayDuties.length}/3
-                                  </span>
-                                </div>
-                                <div className="divide-y divide-slate-100">
-                                  {dayDuties.map((duty, i) => (
-                                    <div key={i} className="flex items-center justify-between px-3 py-2">
-                                      <div 
-                                        className="flex items-center gap-2 cursor-pointer hover:bg-indigo-50 rounded px-2 py-1 -mx-2 -my-1 transition-colors"
-                                        onClick={() => setEditingDuty({ locationId: location.id, teacherId: duty.teacherId, currentDay: duty.day })}
-                                        title="Gün değiştirmek için tıklayın"
-                                      >
-                                        <div className="bg-indigo-50 w-6 h-6 rounded-full flex items-center justify-center text-indigo-600 font-bold text-xs">
-                                          {i + 1}
-                                        </div>
-                                        <span className="text-sm font-medium text-slate-700">{getTeacherName(duty.teacherId)}</span>
-                                      </div>
-                                      <button
-                                        onClick={() => handleRemoveDuty(location.id, duty.teacherId, duty.day)}
-                                        className="text-red-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors"
-                                      >
-                                        <X className="w-3.5 h-3.5" />
-                                      </button>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            );
-                          })}
+                      <div className="space-y-5">
+                        <div className="space-y-3">
+                          <h4 className="text-sm font-medium text-slate-600">Haftalık Nöbetçi Sayısı</h4>
+                          <div className="flex items-center gap-3">
+                            <button
+                              onClick={() => handleChangeWeeklyDutyCount(location.id, Math.max(0, weeklyDutyCount - 1))}
+                              className="w-8 h-8 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold transition-colors"
+                            >
+                              -
+                            </button>
+                            <div className="w-16 text-center">
+                              <span className="text-2xl font-bold text-slate-800">{weeklyDutyCount}</span>
+                            </div>
+                            <button
+                              onClick={() => handleChangeWeeklyDutyCount(location.id, Math.min(10, weeklyDutyCount + 1))}
+                              className="w-8 h-8 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold transition-colors"
+                            >
+                              +
+                            </button>
+                          </div>
+                          <p className="text-xs text-slate-500 mt-2">
+                            Bu nöbet yeri için haftada {weeklyDutyCount} kişi nöbet tutacak ({dailyDutyLabel}).
+                          </p>
                         </div>
-                      )}
 
-                      {/* Görevli Ekle — her zaman göster */}
-                      <DutyAdder
-                        locationId={location.id}
-                        existingDuties={duties}
-                        eligibleTeachers={eligibleTeachers}
-                        onAdd={handleAddDuty}
-                      />
+                        <div className="space-y-3 pt-3 border-t border-slate-200">
+                          <h4 className="text-sm font-medium text-slate-600">Nöbetçi Öğretmen Ata</h4>
+                          <p className="text-xs text-slate-500 -mt-2">
+                            Atadığınız öğretmenler program oluşturulurken nöbet dönüş şekline göre yerleştirilir:
+                            <strong className="text-slate-600"> Sabit</strong> öğretmenler hep bu yerde görev yapar,
+                            <strong className="text-slate-600"> hareketli</strong> öğretmenlerin yeri haftalık döner.
+                            Başka bir yerde de atanmış öğretmen <strong className="text-amber-700">çift nöbet</strong> olarak işaretlenir;
+                            dağıtımda toplam nöbet sayısı gözetilir, aynı güne iki nöbet ancak başka uygun öğretmen yoksa verilir.
+                          </p>
+
+                          {assignedIds.length > 0 && (
+                            <div className="flex flex-wrap gap-2">
+                              {assignedIds.map(tid => {
+                                const t = teacherById.get(tid);
+                                if (!t) return null;
+                                const isHareketli = t.dutyType === 'hareketli';
+                                const otherPlaces = assignedLocationsOf(tid).filter(l => l.id !== location.id);
+                                const isDouble = otherPlaces.length > 0;
+                                return (
+                                  <span
+                                    key={tid}
+                                    className={`inline-flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-full text-xs font-medium border ${
+                                      isDouble
+                                        ? 'bg-amber-50 border-amber-300 text-amber-800'
+                                        : isHareketli
+                                          ? 'bg-violet-50 border-violet-200 text-violet-700'
+                                          : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                    }`}
+                                    title={isDouble ? `Çift nöbet: ${otherPlaces.map(l => l.name).join(', ')} yerinde de görevli` : undefined}
+                                  >
+                                    {t.name}
+                                    {t.dutyType === 'nobetDisi' ? (
+                                      <span
+                                        className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700"
+                                        title="Öğretmen Nöbet Dışı olarak işaretli; programa alınmaz"
+                                      >
+                                        Nöbet Dışı
+                                      </span>
+                                    ) : (
+                                      <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isDouble ? 'bg-amber-100' : isHareketli ? 'bg-violet-100' : 'bg-emerald-100'}`}>
+                                        {isHareketli ? 'Hareketli' : 'Sabit'}
+                                      </span>
+                                    )}
+                                    {isDouble && (
+                                      <span className="inline-flex items-center gap-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-amber-500 text-white">
+                                        <Copy className="w-3 h-3" />
+                                        Çift nöbet
+                                      </span>
+                                    )}
+                                    <button
+                                      onClick={() => handleUnassignTeacher(location.id, tid)}
+                                      className="p-0.5 rounded-full hover:bg-red-100 text-slate-400 hover:text-red-600 transition-colors"
+                                      title="Atamayı kaldır"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          <div className="flex items-center gap-2">
+                            <div className="relative flex-1">
+                              <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+                              <select
+                                value=""
+                                onChange={(e) => handleAssignTeacher(location.id, e.target.value)}
+                                className="w-full pl-9 pr-4 py-2 border border-slate-300 rounded-lg bg-surface text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 appearance-none"
+                              >
+                                <option value="">Öğretmen seçin…</option>
+                                {eligibleTeachers.map(t => {
+                                  const elsewhere = assignedLocationsOf(t.id);
+                                  const isHere = assignedIds.includes(t.id);
+                                  if (isHere) return null;
+                                  return (
+                                    <option key={t.id} value={t.id}>
+                                      {elsewhere.length > 0 ? '⧉ ' : ''}{t.name}
+                                      {elsewhere.length > 0
+                                        ? ` — ${elsewhere.map(l => l.name).join(', ')} yerinde de var (çift nöbet olur)`
+                                        : t.dutyType === 'hareketli' ? ' (Hareketli)' : ''}
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                            </div>
+                          </div>
+
+                          {dailyDutyCount > 0 && assignedIds.length > 0 && assignedIds.length < dailyDutyCount && (
+                            <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-lg">
+                              <p className="text-xs text-amber-700">
+                                Bu yerde her gün {dailyDutyCount} nöbetçi görev yapacak; {assignedIds.length} öğretmen atadınız.
+                                Eksik slotlar nöbet dönüş şekline göre diğer öğretmenlerden tamamlanır.
+                              </p>
+                            </div>
+                          )}
+
+                          {dailyDutyCount > 0 && assignedIds.length >= dailyDutyCount && (
+                            <p className="text-xs text-slate-500">
+                              Atanan {assignedIds.length} öğretmen, haftanın günlerine nöbet dönüş şekline göre dağıtılır.
+                            </p>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -304,116 +353,6 @@ export default function LocationsTab({ locations, setLocations, teachers }: Prop
           </div>
         )}
       </div>
-
-      {/* Gün Değiştirme Modal */}
-      {editingDuty && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setEditingDuty(null)}>
-          <div className="bg-surface rounded-xl p-6 w-full max-w-sm shadow-xl" onClick={e => e.stopPropagation()}>
-            <h3 className="text-lg font-semibold text-slate-800 mb-4">Nöbet Gününü Değiştir</h3>
-            <p className="text-sm text-slate-600 mb-4">
-              <span className="font-medium">{getTeacherName(editingDuty.teacherId)}</span> için yeni gün seçin:
-            </p>
-            <div className="grid grid-cols-5 gap-2 mb-6">
-              {DAYS.map(day => (
-                <button
-                  key={day.id}
-                  onClick={() => handleChangeDutyDay(editingDuty.locationId, editingDuty.teacherId, editingDuty.currentDay, day.id)}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                    day.id === editingDuty.currentDay
-                      ? 'bg-indigo-600 text-white'
-                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                  }`}
-                >
-                  {day.short}
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={() => setEditingDuty(null)}
-              className="w-full bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-medium transition-colors"
-            >
-              İptal
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function DutyAdder({
-  locationId,
-  existingDuties,
-  eligibleTeachers,
-  onAdd,
-}: {
-  locationId: string;
-  existingDuties: LocationDuty[];
-  eligibleTeachers: Teacher[];
-  onAdd: (locationId: string, teacherId: string, day: number) => void;
-}) {
-  const [selectedTeacher, setSelectedTeacher] = useState('');
-  const [selectedDay, setSelectedDay] = useState<number>(0);
-
-  const handleAdd = () => {
-    if (!selectedTeacher || !selectedDay) return;
-    onAdd(locationId, selectedTeacher, selectedDay);
-    setSelectedTeacher('');
-    setSelectedDay(0);
-  };
-
-  const isDuplicate = selectedTeacher && selectedDay
-    ? existingDuties.some(d => d.teacherId === selectedTeacher && d.day === selectedDay)
-    : false;
-
-  const isDayFull = selectedDay
-    ? existingDuties.filter(d => d.day === selectedDay).length >= 3
-    : false;
-
-  return (
-    <div className="border border-dashed border-slate-300 rounded-lg p-4 bg-surface">
-      <h4 className="text-sm font-medium text-slate-600 mb-3 flex items-center gap-2">
-        <UserPlus className="w-4 h-4" />
-        Görevli Ekle
-      </h4>
-      <div className="flex flex-col sm:flex-row gap-3">
-        <select
-          value={selectedTeacher}
-          onChange={(e) => setSelectedTeacher(e.target.value)}
-          className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-surface"
-        >
-          <option value="">Öğretmen seçin...</option>
-          {eligibleTeachers.map(t => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
-
-        <select
-          value={selectedDay || ''}
-          onChange={(e) => setSelectedDay(Number(e.target.value))}
-          className="sm:w-40 px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-surface"
-        >
-          <option value="">Gün seçin...</option>
-          {DAYS.map(d => (
-            <option key={d.id} value={d.id}>{d.label}</option>
-          ))}
-        </select>
-
-        <button
-          onClick={handleAdd}
-          disabled={!selectedTeacher || !selectedDay || isDuplicate || isDayFull}
-          className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          Ata
-        </button>
-      </div>
-      {isDuplicate && (
-        <p className="text-xs text-amber-600 mt-2">Bu öğretmen bu güne zaten atanmış.</p>
-      )}
-      {isDayFull && !isDuplicate && (
-        <p className="text-xs text-amber-600 mt-2">Bu gün için zaten 3 kişi atanmış.</p>
-      )}
     </div>
   );
 }

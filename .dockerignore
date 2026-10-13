@@ -1,0 +1,15 @@
+node_modules
+dist
+out
+release
+installer
+sunum
+_build_tmp*
+.git
+.env
+*.sqlite
+*.sqlite-*
+*.zip
+*.log
+build-log.txt
+server.cjs

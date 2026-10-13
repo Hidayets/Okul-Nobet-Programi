@@ -12,7 +12,10 @@ import {
   Cloud,
   CloudOff,
   Download,
+  RotateCcw,
   X as XIcon,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
 interface BackupItem {
@@ -27,6 +30,8 @@ interface BackupPaths {
   backupDir: string;
   dbExists: boolean;
   externalDir?: string | null;
+  canRestore?: boolean;
+  isCloud?: boolean;
 }
 
 interface ElectronBackupAPI {
@@ -37,6 +42,8 @@ interface ElectronBackupAPI {
   pickExternalBackupDir?: () => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>;
   clearExternalBackupDir?: () => Promise<{ ok: boolean; error?: string }>;
   downloadBackup?: (sourcePath?: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>;
+  restoreBackup?: (backupPath: string) => Promise<{ ok: boolean; restarting?: boolean; error?: string }>;
+  pickAndRestoreBackup?: () => Promise<{ ok: boolean; restarting?: boolean; path?: string; canceled?: boolean; error?: string }>;
   onBackupStatus?: (cb: (data: any) => void) => (() => void) | void;
 }
 
@@ -68,11 +75,17 @@ function formatDate(iso: string): string {
   }
 }
 
-function reasonLabel(name: string): { label: string; tone: 'pre-update' | 'startup' | 'manual' } {
+function reasonLabel(name: string): { label: string; tone: 'pre-update' | 'startup' | 'manual' | 'pre-restore' } {
+  if (name.includes('pre-restore')) return { label: 'Geri yükleme öncesi', tone: 'pre-restore' };
   if (name.includes('pre-update')) return { label: 'Güncelleme öncesi', tone: 'pre-update' };
   if (name.includes('startup')) return { label: 'Günlük otomatik', tone: 'startup' };
   return { label: 'Elle alınan', tone: 'manual' };
 }
+
+const RESTORE_CONFIRM =
+  'Mevcut tüm veriler (öğretmenler, nöbetler, okul bilgileri) seçilen yedekle değiştirilecek.\n\n' +
+  'İşlem öncesi mevcut verinin güvenlik yedeği otomatik alınır ve uygulama yeniden başlatılır.\n\n' +
+  'Devam etmek istiyor musunuz?';
 
 export default function BackupSection() {
   const api = getBackupAPI();
@@ -82,7 +95,9 @@ export default function BackupSection() {
   const [backups, setBackups] = useState<BackupItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [restoringPath, setRestoringPath] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [showBackups, setShowBackups] = useState(true);
 
   const refresh = useCallback(async () => {
     if (!api?.listBackups || !api?.getBackupPaths) return;
@@ -200,12 +215,81 @@ export default function BackupSection() {
     }
   }, [api]);
 
+  const handleRestore = useCallback(async (backupPath: string, backupName: string) => {
+    if (!api?.restoreBackup || !paths?.canRestore) return;
+    if (!confirm(`"${backupName}" yedeğini geri yüklemek istiyor musunuz?\n\n${RESTORE_CONFIRM}`)) {
+      return;
+    }
+    setRestoringPath(backupPath);
+    setMessage(null);
+    try {
+      const res = await api.restoreBackup(backupPath);
+      if (res.ok && res.restarting) {
+        setMessage({ type: 'info', text: 'Yedek geri yükleniyor, uygulama yeniden başlatılıyor...' });
+      } else if (res.ok) {
+        setMessage({ type: 'success', text: 'Yedek başarıyla geri yüklendi.' });
+        refresh();
+      } else {
+        setMessage({ type: 'error', text: res.error || 'Geri yükleme başarısız.' });
+      }
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err?.message || 'Geri yükleme sırasında hata oluştu.' });
+    } finally {
+      setRestoringPath(null);
+    }
+  }, [api, paths?.canRestore, refresh]);
+
+  const handlePickAndRestore = useCallback(async () => {
+    if (!api?.pickAndRestoreBackup || !paths?.canRestore) return;
+    if (!confirm(`Bilgisayarınızdaki bir yedek dosyasını geri yüklemek istiyor musunuz?\n\n${RESTORE_CONFIRM}`)) {
+      return;
+    }
+    setRestoringPath('__pick__');
+    setMessage(null);
+    try {
+      const res = await api.pickAndRestoreBackup();
+      if (res.canceled) return;
+      if (res.ok && res.restarting) {
+        setMessage({ type: 'info', text: 'Yedek geri yükleniyor, uygulama yeniden başlatılıyor...' });
+      } else if (res.ok) {
+        setMessage({ type: 'success', text: 'Yedek başarıyla geri yüklendi.' });
+        refresh();
+      } else {
+        setMessage({ type: 'error', text: res.error || 'Geri yükleme başarısız.' });
+      }
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err?.message || 'Geri yükleme sırasında hata oluştu.' });
+    } finally {
+      setRestoringPath(null);
+    }
+  }, [api, paths?.canRestore, refresh]);
+
   // Otomatik mesaj temizleme
   useEffect(() => {
     if (!message) return;
     const t = setTimeout(() => setMessage(null), 6000);
     return () => clearTimeout(t);
   }, [message]);
+
+  if (paths?.isCloud) {
+    return (
+      <div className="bg-surface p-8 rounded-2xl shadow-sm border border-slate-200">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="bg-cyan-100 p-2 rounded-lg text-cyan-600">
+            <ShieldCheck className="w-6 h-6" />
+          </div>
+          <h2 className="text-xl font-semibold text-slate-800">Veri Yedekleme</h2>
+        </div>
+        <div className="bg-cyan-50 border border-cyan-200 rounded-lg px-4 py-3 flex items-start gap-2 text-sm text-cyan-900">
+          <Info className="w-4 h-4 mt-0.5 flex-shrink-0" />
+          <span>
+            Verileriniz ortak sunucuda tutuluyor; hangi bilgisayardan girerseniz girin aynı verileri görürsünüz.
+            Sunucu her gün otomatik yedek alır, bu bilgisayarda ayrıca yedek almanız gerekmez.
+          </span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-surface p-8 rounded-2xl shadow-sm border border-slate-200">
@@ -381,6 +465,26 @@ export default function BackupSection() {
 
             <button
               type="button"
+              onClick={handlePickAndRestore}
+              disabled={!paths?.canRestore || restoringPath !== null}
+              className="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              title="USB veya başka konumdaki .sqlite yedek dosyasını geri yükleyin"
+            >
+              {restoringPath === '__pick__' ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  Geri yükleniyor...
+                </>
+              ) : (
+                <>
+                  <RotateCcw className="w-4 h-4" />
+                  Dosyadan Geri Yükle
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
               onClick={handleOpenFolder}
               className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors"
             >
@@ -401,71 +505,90 @@ export default function BackupSection() {
 
           {/* Yedek Listesi */}
           <div>
-            <h3 className="text-sm font-medium text-slate-700 mb-3">Son Yedekler</h3>
+            <button
+              type="button"
+              onClick={() => setShowBackups(!showBackups)}
+              className="flex items-center gap-2 text-sm font-medium text-slate-700 mb-3 hover:text-slate-900 transition-colors"
+            >
+              <h3 className="text-sm font-medium">Son Yedekler</h3>
+              {showBackups ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </button>
 
-            {backups.length === 0 ? (
-              <div className="text-sm text-slate-500 bg-slate-50 rounded-lg p-4 border border-dashed border-slate-300">
-                Henüz yedek alınmamış. Uygulama yeniden başladığında otomatik yedek oluşturulur veya
-                yukarıdaki butonla hemen yedek alabilirsiniz.
-              </div>
-            ) : (
-              <ul className="divide-y divide-slate-100 border border-slate-200 rounded-lg overflow-hidden">
-                {backups.map((b) => {
-                  const r = reasonLabel(b.name);
-                  return (
-                    <li
-                      key={b.path}
-                      className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-surface hover:bg-slate-50 transition-colors"
-                    >
-                      <div className="flex items-start sm:items-center gap-3 min-w-0">
-                        <FileArchive className="w-4 h-4 text-cyan-500 flex-shrink-0 mt-0.5 sm:mt-0" />
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-slate-700 truncate" title={b.name}>
-                            {b.name}
-                          </p>
-                          <p className="text-xs text-slate-500 mt-0.5">
-                            {formatDate(b.createdAt)} · {formatBytes(b.size)}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2 flex-shrink-0">
-                        <span
-                          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                            r.tone === 'pre-update'
-                              ? 'bg-indigo-100 text-indigo-700'
-                              : r.tone === 'startup'
-                              ? 'bg-emerald-100 text-emerald-700'
-                              : 'bg-slate-100 text-slate-700'
-                          }`}
+            {showBackups && (
+              <>
+                {backups.length === 0 ? (
+                  <div className="text-sm text-slate-500 bg-slate-50 rounded-lg p-4 border border-dashed border-slate-300">
+                    Henüz yedek alınmamış. Uygulama yeniden başladığında otomatik yedek oluşturulur veya
+                    yukarıdaki butonla hemen yedek alabilirsiniz.
+                  </div>
+                ) : (
+                  <ul className="divide-y divide-slate-100 border border-slate-200 rounded-lg overflow-hidden">
+                    {backups.map((b) => {
+                      const r = reasonLabel(b.name);
+                      return (
+                        <li
+                          key={b.path}
+                          className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-surface hover:bg-slate-50 transition-colors"
                         >
-                          {r.label}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => handleDownload(b.path)}
-                          className="p-1.5 rounded-md text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 transition-colors"
-                          title="Bu yedeği bir konuma indir"
-                        >
-                          <Download className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
+                          <div className="flex items-start sm:items-center gap-3 min-w-0">
+                            <FileArchive className="w-4 h-4 text-cyan-500 flex-shrink-0 mt-0.5 sm:mt-0" />
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium text-slate-700 truncate">{b.name}</p>
+                              <p className="text-xs text-slate-500 mt-0.5">
+                                {formatBytes(b.size)} • {formatDate(b.createdAt)}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <span
+                              className={`text-xs px-2 py-1 rounded-full font-medium ${
+                                r.tone === 'pre-update'
+                                  ? 'bg-amber-100 text-amber-700'
+                                  : r.tone === 'startup'
+                                  ? 'bg-slate-100 text-slate-600'
+                                  : r.tone === 'pre-restore'
+                                  ? 'bg-red-100 text-red-700'
+                                  : 'bg-cyan-100 text-cyan-700'
+                              }`}
+                            >
+                              {r.label}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleRestore(b.path, b.name)}
+                              disabled={!paths?.canRestore || restoringPath !== null}
+                              className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              Geri Yükle
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </>
             )}
           </div>
 
-          <div className="mt-5 p-4 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600 space-y-1">
+          <div className="mt-5 p-4 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600 space-y-2">
             <p className="flex items-start gap-2">
               <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0 text-slate-400" />
               <span>
-                Bir yedeği geri yüklemek için: önce uygulamayı kapatın, yedek klasöründen ilgili
-                <code className="mx-1 px-1.5 py-0.5 rounded bg-slate-200 text-slate-700">.sqlite</code>
-                dosyasını <code className="px-1.5 py-0.5 rounded bg-slate-200 text-slate-700">database.sqlite</code>
-                <span> </span>olarak yeniden adlandırıp veritabanı klasörüne kopyalayın.
+                <strong>Geri Yükle</strong> ile seçtiğiniz yedekteki tüm öğretmenler, nöbetler ve okul
+                bilgileri geri gelir. Yeni eğitim-öğretim yılında öğretmenleri tek tek yazmak yerine
+                geçen yılın yedeğini geri yükleyebilir veya Ayarlar bölümünden yeni dönem eklerken
+                öğretmenleri kopyalayabilirsiniz.
               </span>
             </p>
+            {!paths?.canRestore && (
+              <p className="flex items-start gap-2">
+                <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0 text-slate-400" />
+                <span>
+                  Geri yükleme yalnızca <strong>sunucu (ana bilgisayar)</strong> modunda yapılabilir.
+                </span>
+              </p>
+            )}
           </div>
         </>
       )}

@@ -1,20 +1,64 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { Save, Plus, Trash2, Building2, CheckCircle2, Clock, CalendarDays, Palette, Check, KeyRound, ShieldCheck, Users, Eye, EyeOff, GraduationCap, Mail, CalendarX2 } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Save, Plus, Trash2, Building2, CheckCircle2, Clock, CalendarDays, Palette, Check, KeyRound, ShieldCheck, Users, Eye, EyeOff, GraduationCap, Mail, CalendarX2, ScanSearch } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { format, parseISO } from 'date-fns';
 import { tr } from 'date-fns/locale';
-import { SchoolInfo, VicePrincipal, SchoolSettings, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes, getCurrentAcademicYear, formatAcademicYear, Holiday } from '../types';
+import { SchoolInfo, VicePrincipal, SchoolSettings, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes, getCurrentAcademicYear, formatAcademicYear, Holiday, Teacher, Assignment, Location } from '../types';
+import { applyAdminDetection, formatDetectionSummary, PRINCIPAL_WEEKLY_LESSONS, VICE_PRINCIPAL_WEEKLY_LESSONS } from '../lib/adminDetection';
 import { useTheme, THEMES } from '../ThemeContext';
 import { cn } from '../lib/utils';
-import { fetchMebHolidays } from '../lib/mebCalendar';
+import { MEB_CALENDAR_VERSION } from '../lib/mebCalendar';
+import { runMebHolidaySync } from '../hooks/useMebCalendarSync';
+import { stripAssignmentsOnHolidays } from '../lib/holidaySchedule';
+import {
+  fillFreedHolidayDates,
+  generateDutyAssignmentsForDate,
+  shouldFillDutyAfterHolidayRemoval,
+} from '../lib/fillDutyDay';
 import BackupSection from './BackupSection';
+import { getAuthHeaders } from '../lib/apiHeaders';
+import { getTimeDiffInMinutes, normalizeClock, shiftLessonTimes } from '../lib/lessonTimes';
+import { dutyClockRange, formatDutyClock } from '../lib/dutyHours';
 
 interface Props {
   schoolInfo: SchoolInfo;
   setSchoolInfo: React.Dispatch<React.SetStateAction<SchoolInfo>>;
+  teachers: Teacher[];
+  locations: Location[];
   holidays: Holiday[];
   setHolidays: React.Dispatch<React.SetStateAction<Holiday[]>>;
+  assignments?: Assignment[];
+  setAssignments?: React.Dispatch<React.SetStateAction<Assignment[]>>;
   activeYear: string;
+  isAdmin?: boolean;
+}
+
+function LessonClockInput({ value, onCommit }: { value: string; onCommit: (next: string) => void }) {
+  return (
+    <input
+      key={value}
+      type="text"
+      inputMode="numeric"
+      spellCheck={false}
+      maxLength={8}
+      defaultValue={value}
+      placeholder="08:30"
+      title="Saat biçimi 08:30. Kutudan çıkınca bu ders ve sonrakiler kayar."
+      onFocus={(e) => e.currentTarget.select()}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
+      onBlur={(e) => {
+        const next = normalizeClock(e.target.value);
+        if (!next || next === value) {
+          e.currentTarget.value = value;
+          return;
+        }
+        onCommit(next);
+      }}
+      className="px-2 py-1 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 w-full"
+    />
+  );
 }
 
 const DAYS_OF_WEEK = [
@@ -27,9 +71,39 @@ const DAYS_OF_WEEK = [
   { id: 0, label: 'Pazar', short: 'Paz' },
 ];
 
-export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHolidays, activeYear }: Props) {
+export default function SettingsTab({ schoolInfo, setSchoolInfo, teachers, locations, holidays, setHolidays, assignments = [], setAssignments, activeYear, isAdmin = false }: Props) {
   const { theme, setTheme } = useTheme();
   const [info, setInfo] = useState<SchoolInfo>(schoolInfo);
+  // Form düzenlenmediyse dışarıdan gelen güncel okul bilgisini forma yansıt.
+  const syncedInfoRef = useRef(schoolInfo);
+  useEffect(() => {
+    const lastSynced = syncedInfoRef.current;
+    syncedInfoRef.current = schoolInfo;
+    setInfo(prev => (prev === lastSynced ? schoolInfo : prev));
+  }, [schoolInfo]);
+
+  const applyAcademicYears = (updatedYears: string[]) => {
+    setSchoolInfo(prev => ({ ...prev, academicYears: updatedYears }));
+    if (info !== syncedInfoRef.current) {
+      setInfo(prev => ({ ...prev, academicYears: updatedYears }));
+    }
+  };
+
+  /** Yalnızca bu formda düzenlenen alanları en güncel okul bilgisinin üzerine yazar. */
+  const saveFormFields = (source: SchoolInfo) => {
+    syncedInfoRef.current = source;
+    setSchoolInfo(prev => ({
+      ...prev,
+      valilik: source.valilik,
+      kaymakamlik: source.kaymakamlik,
+      okulAdi: source.okulAdi,
+      okulMuduru: source.okulMuduru,
+      mudurYardimcilari: source.mudurYardimcilari,
+      settings: source.settings,
+      gmailEmail: source.gmailEmail,
+      gmailAppPassword: source.gmailAppPassword,
+    }));
+  };
   const [newVpName, setNewVpName] = useState('');
   const [showSuccess, setShowSuccess] = useState(false);
 
@@ -56,10 +130,9 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
     setPwMessage(null);
 
     try {
-      const token = localStorage.getItem('token');
       const res = await fetch('/api/auth/change-password', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           targetRole,
           currentPassword: targetRole === 'admin' ? adminCurrentPw : undefined,
@@ -68,6 +141,8 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
       });
       const data = await res.json();
       if (res.ok) {
+        // Kendi şifresini değiştiren yöneticinin oturumu yeni token ile sürer; diğer cihazlardaki oturumlar kapanır.
+        if (typeof data.token === 'string') localStorage.setItem('token', data.token);
         setPwMessage({ type: 'success', text: targetRole === 'admin' ? 'Admin şifresi değiştirildi.' : 'Öğretmen şifresi değiştirildi.' });
         setAdminCurrentPw('');
         setAdminNewPw('');
@@ -108,31 +183,42 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
     setAddingYear(true);
     try {
       if (copyTeachers && copyFromYear && (info.academicYears || []).length > 0) {
-        const token = localStorage.getItem('token');
-        const res = await fetch(`/api/data/teachers__${copyFromYear}`, {
-          headers: { 'Authorization': `Bearer ${token}` }
+        const targetRes = await fetch(`/api/data/teachers__${newYearStart}`, {
+          headers: getAuthHeaders()
         });
-        if (res.ok) {
+        const targetTeachers = targetRes.ok ? await targetRes.json() : [];
+        const res = await fetch(`/api/data/teachers__${copyFromYear}`, {
+          headers: getAuthHeaders()
+        });
+        if (!res.ok) {
+          alert('Öğretmen listesi kopyalanamadı: kaynak dönemin öğretmenleri okunamadı.');
+          return;
+        }
+        if (Array.isArray(targetTeachers) && targetTeachers.length > 0) {
+          alert(`${formatAcademicYear(newYearStart)} döneminde zaten öğretmen kaydı olduğu için kopyalama yapılmadı.`);
+        } else {
           const teachers = await res.json();
+          let failed = 0;
           for (const teacher of teachers) {
             const { schedule, ...teacherInfo } = teacher;
-            await fetch(`/api/data/teachers__${newYearStart}`, {
+            const postRes = await fetch(`/api/data/teachers__${newYearStart}`, {
               method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              },
+              headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
               body: JSON.stringify({ ...teacherInfo, id: uuidv4() })
             });
+            if (!postRes.ok) failed++;
+          }
+          if (failed > 0) {
+            alert(`${failed} öğretmen yeni döneme kopyalanamadı.`);
           }
         }
       }
 
       const updatedYears = [...(info.academicYears || []), newYearStart].sort();
-      setSchoolInfo(prev => ({ ...prev, academicYears: updatedYears }));
-      setInfo(prev => ({ ...prev, academicYears: updatedYears }));
+      applyAcademicYears(updatedYears);
     } catch (err) {
       console.error('Error adding year:', err);
+      alert('Dönem eklenirken bağlantı hatası oluştu.');
     } finally {
       setAddingYear(false);
     }
@@ -143,14 +229,29 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
     if (years.length <= 1) return;
     if (!confirm(`"${formatAcademicYear(year)}" dönemini listeden kaldırmak istediğinize emin misiniz?`)) return;
     const updatedYears = years.filter(y => y !== year);
-    setSchoolInfo(prev => ({ ...prev, academicYears: updatedYears }));
-    setInfo(prev => ({ ...prev, academicYears: updatedYears }));
+    applyAcademicYears(updatedYears);
   };
 
   const settings: SchoolSettings = info.settings ?? DEFAULT_SCHOOL_SETTINGS;
 
   const updateSettings = (patch: Partial<SchoolSettings>) => {
     setInfo({ ...info, settings: { ...settings, ...patch } });
+  };
+
+  const commitLessonTime = (idx: number, field: 'start' | 'end', raw: string) => {
+    const value = normalizeClock(raw);
+    if (!value) return;
+    setInfo(prev => {
+      const current = prev.settings ?? DEFAULT_SCHOOL_SETTINGS;
+      const base = current.manualLessonTimes && current.manualLessonTimes.length > 0
+        ? current.manualLessonTimes
+        : calculateLessonTimes(current);
+      if (!base[idx] || base[idx][field] === value) return prev;
+      return {
+        ...prev,
+        settings: { ...current, manualLessonTimes: shiftLessonTimes(base, idx, field, value) },
+      };
+    });
   };
 
   const lessonTimes = useMemo(() => calculateLessonTimes(settings), [settings]);
@@ -162,8 +263,20 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
     }
   }, [showSuccess]);
 
+  const handleDetectAdmins = () => {
+    const { schoolInfo: next, detection } = applyAdminDetection(info, teachers, { overwrite: true });
+    const summary = formatDetectionSummary(detection);
+    if (!summary) {
+      setPwMessage({ type: 'error', text: 'Ders programında müdür veya müdür yardımcısı tespit edilemedi.' });
+      return;
+    }
+    setInfo(next);
+    saveFormFields(next);
+    setPwMessage({ type: 'success', text: `Otomatik tespit: ${summary}` });
+  };
+
   const handleSave = () => {
-    setSchoolInfo(info);
+    saveFormFields(info);
     setShowSuccess(true);
   };
 
@@ -205,17 +318,48 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
     e.preventDefault();
     if (!newHolidayDate || !newHolidayName.trim()) return;
     if (holidays.some(h => h.date === newHolidayDate)) return;
-    setHolidays([...holidays, {
+    const dutiesOnDate = assignments.filter(a => a.date === newHolidayDate).length;
+    if (dutiesOnDate > 0 && setAssignments) {
+      if (!confirm(`Bu tarihte ${dutiesOnDate} nöbet ataması var. Tatil eklenirse bu atamalar silinecek. Devam edilsin mi?`)) return;
+      setAssignments(prev => prev.filter(a => a.date !== newHolidayDate));
+    }
+    setHolidays(prev => [...prev, {
       id: uuidv4(),
       date: newHolidayDate,
       name: newHolidayName.trim(),
+      source: 'manual',
     }]);
     setNewHolidayDate('');
     setNewHolidayName('');
   };
 
   const handleDeleteHoliday = (id: string) => {
-    setHolidays(holidays.filter(h => h.id !== id));
+    const removed = holidays.find(h => h.id === id);
+    const nextHolidays = holidays.filter(h => h.id !== id);
+    setHolidays(prev => prev.filter(h => h.id !== id));
+
+    if (!removed || !setAssignments || locations.length === 0) return;
+
+    // Formdaki kaydedilmemiş değil, kayıtlı okul günleri kullanılır.
+    const schoolDays = schoolInfo.settings?.schoolDays?.length ? schoolInfo.settings.schoolDays : settings.schoolDays;
+    if (!shouldFillDutyAfterHolidayRemoval(removed.date, assignments, schoolDays)) return;
+
+    const newDayAssignments = generateDutyAssignmentsForDate(
+      removed.date,
+      teachers,
+      locations,
+      assignments,
+      nextHolidays,
+      schoolDays,
+    );
+
+    if (newDayAssignments.length > 0) {
+      setAssignments(prev => [...prev, ...newDayAssignments]);
+      setMebResult({
+        type: 'success',
+        text: `${format(parseISO(removed.date), 'dd.MM.yyyy', { locale: tr })} tarihi için ${newDayAssignments.length} nöbet ataması eklendi.`,
+      });
+    }
   };
 
   const [fetchingMeb, setFetchingMeb] = useState(false);
@@ -225,29 +369,62 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
     setFetchingMeb(true);
     setMebResult(null);
     try {
-      const { holidays: fetched, source } = await fetchMebHolidays(activeYear);
+      const { holidays: merged, source, sync, contentHash, title } = await runMebHolidaySync(activeYear, holidays);
 
-      if (fetched.length === 0) {
+      if (sync.changed) {
+        setHolidays(merged);
+        let filledCount = 0;
+        if (setAssignments) {
+          // Tatil olmaktan çıkan günler, elle silinen tatildeki gibi nöbetle doldurulur.
+          const schoolDays = schoolInfo.settings?.schoolDays?.length ? schoolInfo.settings.schoolDays : settings.schoolDays;
+          const stripped = stripAssignmentsOnHolidays(assignments, merged);
+          const filled = locations.length > 0
+            ? fillFreedHolidayDates(sync.removedDates, stripped, teachers, locations, merged, schoolDays)
+            : [];
+          filledCount = filled.length;
+          setAssignments(prev => {
+            const next = stripAssignmentsOnHolidays(prev, merged);
+            const datesWithDuty = new Set(prev.map(a => a.date));
+            const toAdd = filled.filter(a => !datesWithDuty.has(a.date));
+            return next.length !== prev.length || toAdd.length > 0 ? [...next, ...toAdd] : prev;
+          });
+        }
+        const parts: string[] = [];
+        if (sync.added > 0) parts.push(`${sync.added} yeni`);
+        if (sync.updated > 0) parts.push(`${sync.updated} güncellenen`);
+        if (sync.removed > 0) parts.push(`${sync.removed} kaldırılan`);
+        if (filledCount > 0) parts.push(`tatil olmaktan çıkan günlere ${filledCount} nöbet eklendi`);
+        const sourceLabel = source === 'meb' ? 'MEB resmi takviminden' : 'resmi tatil verilerinden';
+        setMebResult({
+          type: 'success',
+          text: `Tatil takvimi ${sourceLabel} güncellendi${parts.length ? ` (${parts.join(', ')})` : ''}. Toplam: ${merged.length} gün`,
+        });
+      } else if (merged.length === 0) {
         setMebResult({
           type: 'warning',
-          text: `${formatAcademicYear(activeYear)} için henüz takvim verisi bulunamadı. Tatil günlerini elle ekleyebilirsiniz.`,
+          text: `${formatAcademicYear(activeYear, title)} için henüz takvim verisi bulunamadı. Tatil günlerini elle ekleyebilirsiniz.`,
         });
-        return;
+      } else {
+        setMebResult({ type: 'success', text: 'MEB tatil takvimi güncel, değişiklik yok.' });
       }
 
-      const existingDates = new Set(holidays.map(h => h.date));
-      const newHolidays = fetched.filter(h => !existingDates.has(h.date));
-
-      if (newHolidays.length === 0) {
-        setMebResult({ type: 'success', text: 'Tüm tatil günleri zaten yüklü.' });
-        return;
-      }
-
-      setHolidays([...holidays, ...newHolidays]);
-      const sourceLabel = source === 'meb' ? 'MEB resmi takviminden' : 'resmi tatil verilerinden';
-      setMebResult({
-        type: 'success',
-        text: `${newHolidays.length} tatil günü ${sourceLabel} yüklendi. (Toplam: ${fetched.length})`,
+      setSchoolInfo(prev => {
+        const years = new Set(prev.academicYears || []);
+        years.add(activeYear);
+        return {
+          ...prev,
+          academicYears: Array.from(years).sort(),
+          mebCalendarSync: {
+            ...prev.mebCalendarSync,
+            [activeYear]: {
+              version: MEB_CALENDAR_VERSION,
+              syncedAt: new Date().toISOString(),
+              source,
+              contentHash,
+              title: title || `${activeYear} Eğitim-Öğretim Yılı`,
+            },
+          },
+        };
       });
     } catch {
       setMebResult({ type: 'error', text: 'Takvim verileri alınamadı. Lütfen tekrar deneyin.' });
@@ -255,6 +432,8 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
       setFetchingMeb(false);
     }
   };
+
+  const mebSyncMeta = schoolInfo.mebCalendarSync?.[activeYear];
 
   return (
     <div className="w-full mx-auto space-y-6">
@@ -342,7 +521,7 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
                   <li key={year} className="px-4 py-3 flex items-center justify-between bg-slate-50">
                     <div className="flex items-center gap-3">
                       <GraduationCap className="w-4 h-4 text-violet-500" />
-                      <span className="font-medium text-slate-700">{formatAcademicYear(year)}</span>
+                      <span className="font-medium text-slate-700">{formatAcademicYear(year, info.mebCalendarSync?.[year]?.title)}</span>
                       {year === getCurrentAcademicYear() && (
                         <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-700">
                           Güncel
@@ -600,13 +779,28 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
             </div>
             <div className="space-y-2">
               <label className="block text-sm font-medium text-slate-700">Okul Müdürü</label>
-              <input
-                type="text"
-                value={info.okulMuduru}
-                onChange={(e) => setInfo({ ...info, okulMuduru: e.target.value })}
-                placeholder="Örn: Ahmet YILMAZ"
-                className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={info.okulMuduru}
+                  onChange={(e) => setInfo({ ...info, okulMuduru: e.target.value })}
+                  placeholder="Örn: Ahmet YILMAZ"
+                  className="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleDetectAdmins}
+                  className="shrink-0 px-3 py-2 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 text-sm font-medium hover:bg-indigo-100 transition-colors flex items-center gap-1.5"
+                  title="Öğretmen ders programlarından müdür ve müdür yardımcılarını tespit et"
+                >
+                  <ScanSearch className="w-4 h-4" />
+                  Otomatik Tespit
+                </button>
+              </div>
+              <p className="text-xs text-slate-500">
+                Ders programında &quot;Müdür&quot;, &quot;İdare&quot; gibi hücrelerden, öğretmen adından veya haftalık ders saatinden
+                (müdür: {PRINCIPAL_WEEKLY_LESSONS} saat, müdür yardımcısı: {VICE_PRINCIPAL_WEEKLY_LESSONS} saat) algılanır.
+              </p>
             </div>
           </div>
 
@@ -663,6 +857,7 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
         </div>
 
         <div className="space-y-6">
+          {/* Otomatik Ayarlar */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
             <div className="space-y-2">
               <label className="block text-sm font-medium text-slate-700">Günlük Ders Sayısı</label>
@@ -738,11 +933,41 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
               />
               <p className="text-xs text-slate-400">20-90 dakika</p>
             </div>
+
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-slate-700">Nöbet, ilk dersten kaç dk önce</label>
+              <input
+                type="number"
+                min={0}
+                max={60}
+                value={settings.dutyMinutesBefore ?? 15}
+                onChange={(e) => updateSettings({ dutyMinutesBefore: Math.max(0, Math.min(60, parseInt(e.target.value) || 0)) })}
+                className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+              <p className="text-xs text-slate-400">0-60 dakika</p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-slate-700">Nöbet, son dersten kaç dk sonra</label>
+              <input
+                type="number"
+                min={0}
+                max={60}
+                value={settings.dutyMinutesAfter ?? 15}
+                onChange={(e) => updateSettings({ dutyMinutesAfter: Math.max(0, Math.min(60, parseInt(e.target.value) || 0)) })}
+                className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+              />
+              <p className="text-xs text-slate-400">0-60 dakika. Çıktıda nöbet saati bu aralıktan yazılır.</p>
+            </div>
           </div>
 
-          {/* Ders Saatleri Önizleme */}
+          {/* Ders Saatleri Önizleme ve Düzenleme */}
           <div className="pt-6 border-t border-slate-100">
             <h3 className="text-md font-medium text-slate-800 mb-4">Ders Saatleri Çizelgesi</h3>
+            {formatDutyClock(dutyClockRange(settings)) && (
+              <p className="text-sm text-slate-600 mb-3">Nöbet saati: {formatDutyClock(dutyClockRange(settings))}</p>
+            )}
+            <p className="text-sm text-slate-500 mb-4">Otomatik hesaplanan saatleri manuel olarak düzenleyebilirsiniz. Saat kutusundan çıkınca o ders ve sonraki dersler kayar; önceki derslerin başlangıç ve bitiş saatleri aynı kalır.</p>
             <div className="overflow-x-auto">
               <table className="w-full border-collapse">
                 <thead>
@@ -754,26 +979,31 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {lessonTimes.map((lt, idx) => {
-                    const isBeforeLunch = lt.lesson === settings.lunchAfterLesson;
-                    const isLast = idx === lessonTimes.length - 1;
+                  {(settings.manualLessonTimes || lessonTimes).map((lt, idx, rows) => {
+                    const isBeforeLunch = (lt.lesson || idx + 1) === settings.lunchAfterLesson;
+                    const isLast = idx === rows.length - 1;
+                    const gap = !isLast ? getTimeDiffInMinutes(lt.end, rows[idx + 1].start) : 0;
                     return (
-                      <tr key={lt.lesson} className={isBeforeLunch ? 'bg-amber-50/50' : ''}>
+                      <tr key={idx} className={isBeforeLunch ? 'bg-amber-50/50' : ''}>
                         <td className="py-2.5 px-3">
                           <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 text-sm font-semibold">
-                            {lt.lesson}
+                            {lt.lesson || idx + 1}
                           </span>
                         </td>
-                        <td className="py-2.5 px-3 font-medium text-slate-700">{lt.start}</td>
-                        <td className="py-2.5 px-3 font-medium text-slate-700">{lt.end}</td>
+                        <td className="py-2.5 px-3">
+                          <LessonClockInput value={lt.start} onCommit={(next) => commitLessonTime(idx, 'start', next)} />
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <LessonClockInput value={lt.end} onCommit={(next) => commitLessonTime(idx, 'end', next)} />
+                        </td>
                         <td className="py-2.5 px-3">
                           {!isLast && (
                             isBeforeLunch ? (
                               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
-                                Öğle Arası — {settings.lunchDuration} dk
+                                Öğle Arası — {gap} dk
                               </span>
                             ) : (
-                              <span className="text-sm text-slate-500">{settings.breakDuration} dk teneffüs</span>
+                              <span className="text-sm text-slate-500">{gap} dk teneffüs</span>
                             )
                           )}
                         </td>
@@ -783,6 +1013,14 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
                 </tbody>
               </table>
             </div>
+            <button
+              onClick={() => {
+                updateSettings({ manualLessonTimes: undefined });
+              }}
+              className="mt-4 text-sm text-slate-500 hover:text-slate-700 underline"
+            >
+              Otomatik hesaplanan saatlere geri dön
+            </button>
           </div>
         </div>
       </div>
@@ -848,14 +1086,23 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
             ) : (
               <>
                 <CalendarX2 className="w-4 h-4" />
-                MEB {formatAcademicYear(activeYear)} Takviminden Yükle
+                MEB {formatAcademicYear(activeYear, mebSyncMeta?.title)} Takviminden Yükle
               </>
             )}
           </button>
           <p className="text-xs text-slate-400 mt-2">
-            MEB resmi takviminden ara tatiller, yarıyıl tatili, dini bayramlar ve resmi tatiller otomatik yüklenir.
+            MEB resmi haber sayfasından ara tatiller ve yarıyıl tatili canlı çekilir; dini bayramlar ve resmi tatiller birleştirilir.
             29 Ekim, 23 Nisan ve 19 Mayıs MEB tarafından iş günü sayıldığı için dahil edilmez.
+            Uygulama her açılışta güncel takvimi otomatik kontrol eder.
           </p>
+          {mebSyncMeta && (
+            <p className="text-xs text-slate-500 mt-2">
+              Son MEB kontrolü:{' '}
+              {format(new Date(mebSyncMeta.syncedAt), 'dd MMMM yyyy HH:mm', { locale: tr })}
+              {' · '}kaynak: {mebSyncMeta.source === 'meb' ? 'MEB takvimi' : mebSyncMeta.source === 'api' ? 'resmi tatil API' : '—'}
+              {mebSyncMeta.title ? ` · ${mebSyncMeta.title}` : ''}
+            </p>
+          )}
 
           {mebResult && (
             <div className={`mt-3 px-4 py-3 rounded-lg text-sm font-medium flex items-center gap-2 ${
@@ -930,7 +1177,7 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, holidays, setHo
         )}
 
         <p className="text-xs text-slate-400 mt-3">
-          Toplam {holidays.length} tatil/özel gün tanımlı. Bu günlerde nöbet ataması yapılmayacaktır.
+          Toplam {holidays.length} tatil/özel gün tanımlı. Tatil silindiğinde, mevcut nöbet programı aralığındaki o güne otomatik nöbet atanır.
         </p>
       </div>
 

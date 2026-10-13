@@ -1,10 +1,15 @@
 import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import { User, LicenseSummary } from './types';
+import { getActingKurumKodu, setActingKurumKoduStorage } from './lib/apiHeaders';
+import { AUTH_RECHECK_EVENT } from './lib/syncEvents';
 
 interface AuthContextType {
   user: User | null;
   license: LicenseSummary | null;
   loading: boolean;
+  /** Superadmin'in hangi kurum verisiyle çalıştığı */
+  actingKurumKodu: string | null;
+  setActingKurumKodu: (kurumKodu: string | null) => void;
   /** Lisansı pasif/expired bulunup oturum sonlandırıldığında set edilir. */
   licenseLockout: { reason: 'inactive' | 'expired'; message: string } | null;
   signOut: () => Promise<void>;
@@ -18,6 +23,8 @@ const AuthContext = createContext<AuthContextType>({
   user: null,
   license: null,
   loading: true,
+  actingKurumKodu: null,
+  setActingKurumKodu: () => {},
   licenseLockout: null,
   signOut: async () => {},
   setUser: () => {},
@@ -34,6 +41,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [user, setUser] = useState<User | null>(null);
   const [license, setLicense] = useState<LicenseSummary | null>(null);
   const [loading, setLoading] = useState(true);
+  const [actingKurumKodu, setActingKurumKoduState] = useState<string | null>(() => getActingKurumKodu());
   const [licenseLockout, setLicenseLockout] = useState<
     { reason: 'inactive' | 'expired'; message: string } | null
   >(null);
@@ -42,8 +50,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const userRef = useRef<User | null>(null);
   useEffect(() => { userRef.current = user; }, [user]);
 
+  const setActingKurumKodu = useCallback((kurumKodu: string | null) => {
+    setActingKurumKoduStorage(kurumKodu);
+    setActingKurumKoduState(kurumKodu);
+  }, []);
+
   const signOut = useCallback(async () => {
     localStorage.removeItem('token');
+    setActingKurumKoduStorage(null);
+    setActingKurumKoduState(null);
     setUser(null);
     setLicense(null);
   }, []);
@@ -63,7 +78,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (res.ok) {
         const data = await res.json();
-        setUser(data.user);
+        const next: User = data.user;
+        setUser((prev) =>
+          prev && prev.uid === next.uid && prev.kurumKodu === next.kurumKodu && prev.role === next.role
+            ? prev
+            : next,
+        );
         setLicense(data.license || null);
         return;
       }
@@ -116,10 +136,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const onFocus = () => refreshAuth();
     window.addEventListener('focus', onFocus);
+    window.addEventListener(AUTH_RECHECK_EVENT, onFocus);
 
     return () => {
       window.clearInterval(id);
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener(AUTH_RECHECK_EVENT, onFocus);
     };
   }, [user, refreshAuth]);
 
@@ -129,6 +151,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         user,
         license,
         loading,
+        actingKurumKodu,
+        setActingKurumKodu,
         licenseLockout,
         signOut,
         setUser,
