@@ -6,12 +6,13 @@ import PrintPreview, { capturePrintHtml } from './PrintPreview';
 import * as XLSX from 'xlsx';
 import { exportDutyScheduleToExcel } from '../lib/dutyScheduleExcel';
 import { buildTeacherColorMap, getTeacherSubject, getTeacherBarColor } from '../lib/teacherColors';
-import { Teacher, Location, Assignment, SchoolInfo, ScheduleArchive, formatAcademicYear, canTeacherDutyOnDay, Holiday, Absence, Substitution, DutyChange, DutyChangeReason, DUTY_CHANGE_REASONS } from '../types';
+import { Teacher, Location, Assignment, SchoolInfo, ScheduleArchive, formatAcademicYear, canTeacherDutyOnDay, Holiday, Absence, Substitution, DutyChange, DutyChangeReason, DUTY_CHANGE_REASONS, SwapRequest } from '../types';
 import { dutyChangeWarnings } from '../lib/dutyChangeWarning';
 import { dutyClockRange, formatDutyClock } from '../lib/dutyHours';
 import { scanSchedule } from '../lib/scheduleScan';
 import TodayBoard from './TodayBoard';
 import MyDutyList from './MyDutyList';
+import SwapRequestsPanel from './SwapRequestsPanel';
 import ScheduleWarnings from './ScheduleWarnings';
 import { getAuthHeaders } from '../lib/apiHeaders';
 import { computeLocationDistribution, computeMonthDistribution } from '../lib/dutyDistribution';
@@ -54,9 +55,11 @@ interface Props {
   scheduleArchives?: ScheduleArchive[];
   setScheduleArchives?: React.Dispatch<React.SetStateAction<ScheduleArchive[]>>;
   onGoToGenerator?: () => void;
+  swapRequests?: SwapRequest[];
+  setSwapRequests?: (next: SwapRequest[] | ((prev: SwapRequest[]) => SwapRequest[])) => Promise<boolean>;
 }
 
-export default function ScheduleTab({ assignments, setAssignments, teachers, locations, schoolInfo, holidays = [], absences = [], substitutions = [], kurumKodu = '', canUndo = false, onUndo, dutyChanges = [], setDutyChanges, editorLabel = 'Admin', isAdmin = false, activeYear, scheduleArchives = [], setScheduleArchives, onGoToGenerator }: Props) {
+export default function ScheduleTab({ assignments, setAssignments, teachers, locations, schoolInfo, holidays = [], absences = [], substitutions = [], kurumKodu = '', canUndo = false, onUndo, dutyChanges = [], setDutyChanges, editorLabel = 'Admin', isAdmin = false, activeYear, scheduleArchives = [], setScheduleArchives, onGoToGenerator, swapRequests = [], setSwapRequests }: Props) {
   const [showNotificationModal, setShowNotificationModal] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<'idle' | 'sending' | 'success'>('idle');
   const printMode = null as 'schedule' | 'dutyCounts' | null;
@@ -741,9 +744,23 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
         kurumKodu={kurumKodu}
         isAdmin={isAdmin}
         dutyHours={dutyHours}
+        swapRequests={swapRequests}
+        setSwapRequests={setSwapRequests}
       />
 
       {isAdmin && <>
+      {setSwapRequests && setAssignments && (
+        <SwapRequestsPanel
+          swapRequests={swapRequests}
+          setSwapRequests={setSwapRequests}
+          assignments={assignments}
+          setAssignments={setAssignments}
+          setDutyChanges={setDutyChanges}
+          teachers={teachers}
+          locations={locations}
+          editorLabel={editorLabel}
+        />
+      )}
       <ScheduleWarnings issues={scheduleIssues} />
       {dutyChanges.length > 0 && (
         <div className="app-card print:hidden">

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { validateSchedules, createTeacherRecognizer } from './scheduleValidation';
+import { validateSchedules, createTeacherRecognizer, validationReportRows } from './scheduleValidation';
 import { Teacher, ClassInfo } from '../types';
 
 const teacher = (name: string, schedule: Teacher['schedule']): Teacher =>
@@ -142,5 +142,22 @@ describe('validateSchedules — sınıf hücresinde öğretmen', () => {
     expect(report.classTeacherIssues).toEqual([]);
     expect(report.uncoveredClassSlots).toEqual([]);
     expect(report.comparisons[0].status).toBe('match');
+  });
+});
+
+describe('validationReportRows', () => {
+  it('sorunları türe, sınıfa ve saate göre sıralı satırlara çevirir', () => {
+    const report = validateSchedules(
+      [
+        teacher('Ali Veli', { 1: { 1: '6-E', 2: '7-A' } }),
+        teacher('Ayşe Kaya', { 1: { 1: '6-E' } }),
+      ],
+      [cls('6-E', { 1: { 1: 'Mat6', 3: 'Fen' } })],
+    );
+    expect(validationReportRows(report).map(r => [r.kind, r.className, r.hour, r.teacher])).toEqual([
+      ['Uyumsuzluk', '6-E', 3, ''],
+      ['Çakışma', '6-E', 1, 'Ali Veli, Ayşe Kaya'],
+      ['Eksik veri', '7-A', 2, 'Ali Veli'],
+    ]);
   });
 });

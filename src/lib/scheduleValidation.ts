@@ -173,6 +173,61 @@ export function createTeacherRecognizer(teachers: Teacher[]): (cellValue: string
   };
 }
 
+/* ─── Rapor satırları (Excel / yazdırma) ─── */
+
+export interface ValidationReportRow {
+  kind: 'Uyumsuzluk' | 'Çakışma' | 'Eksik veri';
+  day: number;
+  hour: number;
+  className: string;
+  teacher: string;
+  detail: string;
+}
+
+const KIND_ORDER: Record<ValidationReportRow['kind'], number> = { 'Uyumsuzluk': 0, 'Çakışma': 1, 'Eksik veri': 2 };
+
+export function validationReportRows(report: ValidationReport): ValidationReportRow[] {
+  const rows: ValidationReportRow[] = [];
+  for (const s of report.uncoveredClassSlots) {
+    rows.push({
+      kind: 'Uyumsuzluk', day: s.day, hour: s.hour, className: s.className, teacher: '',
+      detail: `Sınıfın dersi var ("${s.classValue}"), bu saatte sınıfa dersi olan öğretmen yok`,
+    });
+  }
+  for (const s of report.classTeacherIssues) {
+    const where = s.teacherValue ? `öğretmenin programında bu saatte "${s.teacherValue}" var` : 'öğretmenin programında bu saat boş';
+    const covered = s.coveredBy.length ? `; bu saatte derse giren: ${s.coveredBy.join(', ')}` : '';
+    rows.push({
+      kind: 'Uyumsuzluk', day: s.day, hour: s.hour, className: s.className, teacher: s.teacherName,
+      detail: `Sınıf programında "${s.classValue}" yazıyor, ${where}${covered}`,
+    });
+  }
+  for (const c of report.comparisons) {
+    if (c.status === 'class_slot_empty') {
+      rows.push({
+        kind: 'Uyumsuzluk', day: c.day, hour: c.hour, className: c.className ?? '', teacher: c.teacherName,
+        detail: 'Öğretmen programında bu sınıf var, sınıf programında bu saat boş',
+      });
+    } else if (c.status === 'class_not_found') {
+      rows.push({
+        kind: 'Eksik veri', day: c.day, hour: c.hour, className: c.teacherValue, teacher: c.teacherName,
+        detail: 'Bu sınıfın programı yüklenmemiş',
+      });
+    }
+  }
+  for (const c of report.conflicts) {
+    rows.push({
+      kind: 'Çakışma', day: c.day, hour: c.hour, className: c.className, teacher: c.teacherNames.join(', '),
+      detail: 'Aynı saatte sınıfa birden fazla öğretmen',
+    });
+  }
+  return rows.sort((a, b) =>
+    KIND_ORDER[a.kind] - KIND_ORDER[b.kind]
+    || a.className.localeCompare(b.className, 'tr', { numeric: true })
+    || dayOrder(a.day) - dayOrder(b.day)
+    || a.hour - b.hour);
+}
+
 /* ─── Karşılaştırma ─── */
 
 const dayOrder = (d: number) => (d === 0 ? 7 : d);

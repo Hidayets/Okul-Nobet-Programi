@@ -466,6 +466,7 @@ ipcMain.handle('app:get-info', () => {
     isPackaged: app.isPackaged,
     appMode,
     serverUrl,
+    computerName: os.hostname(),
   };
 });
 

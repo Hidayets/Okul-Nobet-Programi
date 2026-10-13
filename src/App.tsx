@@ -2,7 +2,7 @@ import { Fragment, useState, useEffect, useMemo, useCallback } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { cn } from './lib/utils';
 import AppShell, { AppTab } from './components/AppShell';
-import { Teacher, Location, Assignment, Absence, Substitution, SchoolInfo, ClassInfo, Holiday, ScheduleArchive, DutyChange, getCurrentAcademicYear, getRelevantAcademicYears, sortLocationsByOrder } from './types';
+import { Teacher, Location, Assignment, Absence, Substitution, SchoolInfo, ClassInfo, Holiday, ScheduleArchive, DutyChange, SwapRequest, getCurrentAcademicYear, getRelevantAcademicYears, sortLocationsByOrder } from './types';
 import TeachersTab from './components/TeachersTab';
 import LocationsTab from './components/LocationsTab';
 import GeneratorTab from './components/GeneratorTab';
@@ -22,7 +22,7 @@ import { useAuth } from './AuthContext';
 import { useApiSync } from './hooks/useApiSync';
 import { useApiDoc } from './hooks/useApiDoc';
 import { unifyTeachers } from './lib/teacherMatching';
-import { getAuthHeaders } from './lib/apiHeaders';
+import { getAuthHeaders, setClientName } from './lib/apiHeaders';
 import { useMebCalendarSync, MebSyncOutcome } from './hooks/useMebCalendarSync';
 import { useUndoableUpdates } from './hooks/useUndoableUpdates';
 import { SYNC_ERROR_EVENT } from './lib/syncEvents';
@@ -118,6 +118,7 @@ export default function App() {
   const [holidays, setHolidays, holidaysLoaded] = useApiSync<Holiday>(scopedCollection('holidays'), []);
   const [scheduleArchives, setScheduleArchives] = useApiSync<ScheduleArchive>(scopedCollection('scheduleArchives'), []);
   const [dutyChanges, setDutyChanges] = useApiSync<DutyChange>(scopedCollection('dutyChanges'), []);
+  const [swapRequests, setSwapRequests] = useApiSync<SwapRequest>(scopedCollection('swapRequests'), []);
 
   const [schoolInfo, setSchoolInfo, schoolInfoLoaded] = useApiDoc<SchoolInfo>('schoolInfo/info', {
     valilik: '',
@@ -251,6 +252,7 @@ export default function App() {
     if (api?.getAppInfo) {
       api.getAppInfo().then((info: any) => {
         if (info?.version) setAppVersion(info.version);
+        setClientName(info?.computerName);
       }).catch(() => {});
     }
   }, []);
@@ -523,6 +525,8 @@ export default function App() {
             scheduleArchives={scheduleArchives}
             setScheduleArchives={setScheduleArchives}
             onGoToGenerator={isAdmin ? () => setActiveTab('generator') : undefined}
+            swapRequests={swapRequests}
+            setSwapRequests={setSwapRequests}
           />
         )}
         {activeTab === 'daily' && (

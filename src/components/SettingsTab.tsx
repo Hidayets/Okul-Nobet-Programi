@@ -16,6 +16,7 @@ import {
   shouldFillDutyAfterHolidayRemoval,
 } from '../lib/fillDutyDay';
 import BackupSection from './BackupSection';
+import ChangeHistorySection from './ChangeHistorySection';
 import { getAuthHeaders } from '../lib/apiHeaders';
 import { getTimeDiffInMinutes, normalizeClock, shiftLessonTimes } from '../lib/lessonTimes';
 import { dutyClockRange, formatDutyClock } from '../lib/dutyHours';
@@ -1226,6 +1227,9 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, teachers, locat
           </div>
         </div>
       </div>
+
+      {/* Değişiklik Geçmişi */}
+      <ChangeHistorySection teachers={teachers} locations={locations} />
 
       {/* Veri Yedekleme */}
       <BackupSection />

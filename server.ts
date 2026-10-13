@@ -11,6 +11,8 @@ import nodemailer from 'nodemailer';
 import crypto from 'crypto';
 import { config as loadDotenv } from 'dotenv';
 import { parseMebCalendarHtml, resolveMebCalendarUrls } from './src/lib/mebCalendarParse.ts';
+import { auditSnapshot, changedTopLevelKeys, collectionBase, sanitizeClientName } from './src/lib/auditLog.ts';
+import { sanitizeTeacherSwapCreate, teacherCancelSwap } from './src/lib/swapRequests.ts';
 
 // CJS (pkg/esbuild) ve ESM (tsx dev) ortamlarında güvenle çalışır
 const __dirname = process.cwd();
@@ -536,6 +538,22 @@ db.exec(`
     isActive INTEGER DEFAULT 1,
     lastLoginAt TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kurumKodu TEXT NOT NULL,
+    at TEXT NOT NULL,
+    role TEXT NOT NULL,
+    client TEXT,
+    ip TEXT,
+    collection TEXT NOT NULL,
+    docId TEXT NOT NULL,
+    action TEXT NOT NULL,
+    before TEXT,
+    after TEXT,
+    changedKeys TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_log_kurum ON audit_log (kurumKodu, id);
 `);
 
 // Migration: scope existing unscoped collections by academic year
@@ -661,6 +679,58 @@ function stripRevision(body: any): any {
   return rest;
 }
 
+const AUDIT_RETENTION_DAYS = 400;
+const insertAuditRow = db.prepare(`
+  INSERT INTO audit_log (kurumKodu, at, role, client, ip, collection, docId, action, before, after, changedKeys)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+/** Kayıt değişikliğini özet olarak saklar. Değişiklik geçmişi yazılamazsa asıl işlem bozulmaz. */
+function writeAudit(
+  req: any,
+  kurumKodu: string,
+  collection: string,
+  docId: string,
+  action: 'create' | 'update' | 'delete',
+  beforeJson: string | null,
+  afterJson: string | null,
+): void {
+  try {
+    const before = beforeJson ? JSON.parse(beforeJson) : null;
+    const after = afterJson ? JSON.parse(afterJson) : null;
+    const changed = action === 'update' ? changedTopLevelKeys(before, after) : [];
+    if (action === 'update' && changed.length === 0) return;
+    const snap = (v: unknown) => {
+      const s = auditSnapshot(v);
+      return s ? JSON.stringify(s) : null;
+    };
+    insertAuditRow.run(
+      kurumKodu,
+      new Date().toISOString(),
+      String(req.user?.role || ''),
+      sanitizeClientName(req.headers['x-client-name']),
+      String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/, '') || null,
+      collection,
+      docId,
+      action,
+      snap(before),
+      snap(after),
+      changed.length ? JSON.stringify(changed) : null,
+    );
+  } catch (err) {
+    console.warn('[audit] Kayıt yazılamadı:', err instanceof Error ? err.message : err);
+  }
+}
+
+function pruneAuditLog(): void {
+  try {
+    const cutoff = new Date(Date.now() - AUDIT_RETENTION_DAYS * 86_400_000).toISOString();
+    db.prepare('DELETE FROM audit_log WHERE at < ?').run(cutoff);
+  } catch (err) {
+    console.warn('[audit] Eski kayıtlar silinemedi:', err instanceof Error ? err.message : err);
+  }
+}
+
 function safeEqual(a: string, b: string): boolean {
   const ha = crypto.createHash('sha256').update(a).digest();
   const hb = crypto.createHash('sha256').update(b).digest();
@@ -767,6 +837,15 @@ async function startServer() {
       return res.status(403).json({ error: 'Bu işlem için yönetici yetkisi gerekir.' });
     }
     next();
+  };
+
+  // İstisna: öğretmen hesabı takas isteği açabilir ve kendi bekleyen isteğini geri çekebilir
+  // (içerik POST/PUT içinde ayrıca sınırlandırılır).
+  const isTeacherSwapWrite = (req: any) =>
+    req.user?.role === 'teacher' && collectionBase(String(req.params.collection || '')) === 'swapRequests';
+  const requireAdminOrSwapRequest = (req: any, res: any, next: any) => {
+    if (isTeacherSwapWrite(req)) return next();
+    return requireAdmin(req, res, next);
   };
 
   // Gmail uygulama şifresi gibi gizli alanlar yönetici olmayanlara gönderilmez.
@@ -1424,11 +1503,15 @@ async function startServer() {
   });
 
   // CRUD: Create Document
-  app.post('/api/data/:collection', authenticateToken, requireActiveLicense, requireAdmin, (req: any, res) => {
+  app.post('/api/data/:collection', authenticateToken, requireActiveLicense, requireAdminOrSwapRequest, (req: any, res) => {
     const { collection } = req.params;
     const kurumKodu = getEffectiveKurumKodu(req);
-    const data = stripRevision(req.body);
-    
+    let data = stripRevision(req.body);
+    if (isTeacherSwapWrite(req)) {
+      data = sanitizeTeacherSwapCreate(data, new Date().toISOString());
+      if (!data) return res.status(400).json({ error: 'Takas isteği eksik ya da hatalı.' });
+    }
+
     // Use provided id or generate one
     const id = data.id || uuidv4();
     if (!data.id) data.id = id;
@@ -1438,6 +1521,7 @@ async function startServer() {
       db.prepare('INSERT INTO documents (collection, id, kurumKodu, data) VALUES (?, ?, ?, ?)').run(
         collection, id, kurumKodu, json
       );
+      writeAudit(req, kurumKodu, collection, id, 'create', null, json);
       res.setHeader('X-Rev', revisionOf(json));
       res.json(data);
     } catch (err) {
@@ -1447,14 +1531,13 @@ async function startServer() {
   });
 
   // CRUD: Update Document
-  app.put('/api/data/:collection/:id', authenticateToken, requireActiveLicense, requireAdmin, (req: any, res) => {
+  app.put('/api/data/:collection/:id', authenticateToken, requireActiveLicense, requireAdminOrSwapRequest, (req: any, res) => {
     const { collection, id } = req.params;
     const kurumKodu = getEffectiveKurumKodu(req);
-    const data = stripRevision(req.body);
+    const teacherSwap = isTeacherSwapWrite(req);
     const ifMatch = typeof req.headers['if-match'] === 'string' ? req.headers['if-match'] : '';
 
     try {
-      const json = JSON.stringify(data);
       // Okuma-karşılaştırma-yazma tek işlemde: arada başka bir yazma araya giremez.
       const outcome = db.transaction(() => {
         const current: any = db.prepare('SELECT data FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').get(
@@ -1462,8 +1545,14 @@ async function startServer() {
         );
         // İstemci okuduğu sürümü bildirdiyse ve kayıt o arada başka yerden değiştiyse üzerine yazılmaz.
         if (current && ifMatch && revisionOf(current.data) !== ifMatch) {
-          return { conflict: true as const, current: current.data as string };
+          return { kind: 'conflict' as const, current: current.data as string };
         }
+        let data = stripRevision(req.body);
+        if (teacherSwap) {
+          data = current ? teacherCancelSwap(JSON.parse(current.data), new Date().toISOString()) : null;
+          if (!data) return { kind: 'forbidden' as const };
+        }
+        const json = JSON.stringify(data);
         if (current) {
           db.prepare('UPDATE documents SET data = ? WHERE collection = ? AND id = ? AND kurumKodu = ?').run(
             json, collection, id, kurumKodu
@@ -1473,18 +1562,22 @@ async function startServer() {
             collection, id, kurumKodu, json
           );
         }
-        return { conflict: false as const };
+        writeAudit(req, kurumKodu, collection, id, current ? 'update' : 'create', current?.data ?? null, json);
+        return { kind: 'saved' as const, data, json };
       })();
 
-      if (outcome.conflict) {
+      if (outcome.kind === 'conflict') {
         return res.status(409).json({
           error: 'Bu kayıt başka bir yerde değiştirilmiş.',
           current: redactForRole(collection, JSON.parse(outcome.current), req.user.role),
           rev: revisionOf(outcome.current),
         });
       }
-      res.setHeader('X-Rev', revisionOf(json));
-      res.json(data);
+      if (outcome.kind === 'forbidden') {
+        return res.status(403).json({ error: 'Öğretmen hesabı yalnızca bekleyen takas isteğini geri çekebilir.' });
+      }
+      res.setHeader('X-Rev', revisionOf(outcome.json));
+      res.json(outcome.data);
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Failed to update document' });
@@ -1497,13 +1590,52 @@ async function startServer() {
     const kurumKodu = getEffectiveKurumKodu(req);
 
     try {
-      db.prepare('DELETE FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').run(
-        collection, id, kurumKodu
-      );
+      db.transaction(() => {
+        const current: any = db.prepare('SELECT data FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').get(
+          collection, id, kurumKodu
+        );
+        if (!current) return;
+        db.prepare('DELETE FROM documents WHERE collection = ? AND id = ? AND kurumKodu = ?').run(
+          collection, id, kurumKodu
+        );
+        writeAudit(req, kurumKodu, collection, id, 'delete', current.data, null);
+      })();
       res.json({ success: true });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Failed to delete document' });
+    }
+  });
+
+  // Değişiklik geçmişi (en yeniden eskiye, sayfalı)
+  app.get('/api/audit', authenticateToken, requireActiveLicense, requireAdmin, (req: any, res) => {
+    const kurumKodu = getEffectiveKurumKodu(req);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 300, 1), 1000);
+    const before = Number(req.query.before) || 0;
+    try {
+      const rows: any[] = before > 0
+        ? db.prepare('SELECT * FROM audit_log WHERE kurumKodu = ? AND id < ? ORDER BY id DESC LIMIT ?').all(kurumKodu, before, limit)
+        : db.prepare('SELECT * FROM audit_log WHERE kurumKodu = ? ORDER BY id DESC LIMIT ?').all(kurumKodu, limit);
+      const parse = (v: string | null) => {
+        if (!v) return null;
+        try { return JSON.parse(v); } catch { return null; }
+      };
+      res.json(rows.map(r => ({
+        id: r.id,
+        at: r.at,
+        role: r.role,
+        client: r.client,
+        ip: r.ip,
+        collection: r.collection,
+        docId: r.docId,
+        action: r.action,
+        before: parse(r.before),
+        after: parse(r.after),
+        changedKeys: parse(r.changedKeys) || [],
+      })));
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: 'Değişiklik geçmişi okunamadı.' });
     }
   });
 
@@ -1703,6 +1835,8 @@ async function startServer() {
     process.exit(1);
   });
   startCloudBackups();
+  pruneAuditLog();
+  setInterval(pruneAuditLog, 24 * 60 * 60 * 1000);
 }
 
 startServer().catch((err) => {

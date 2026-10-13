@@ -1,11 +1,12 @@
 import React, { useRef, useState, useMemo, useCallback } from 'react';
-import { Upload, CheckCircle2, AlertCircle, BookOpen, Users, GraduationCap, ChevronDown, Trash2, Scale, X as XIcon, AlertTriangle, ChevronRight, PenLine, Plus } from 'lucide-react';
+import { Upload, CheckCircle2, AlertCircle, BookOpen, Users, GraduationCap, ChevronDown, Trash2, Scale, X as XIcon, AlertTriangle, ChevronRight, PenLine, Plus, FileSpreadsheet, Printer } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { v4 as uuidv4 } from 'uuid';
 import { Teacher, ClassInfo, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes } from '../types';
 import { unifyTeachers, findTeacherFuzzy } from '../lib/teacherMatching';
 import { applyAdminDetection, formatDetectionSummary } from '../lib/adminDetection';
-import { validateSchedules, ValidationReport } from '../lib/scheduleValidation';
+import { validateSchedules, validationReportRows, ValidationReport } from '../lib/scheduleValidation';
+import PrintPreview from './PrintPreview';
 
 const DAY_NUM_TO_SHORT: Record<number, string> = {
   1: 'Pzt', 2: 'Sal', 3: 'Çar', 4: 'Per', 5: 'Cum', 6: 'Cmt', 0: 'Paz'
@@ -420,6 +421,48 @@ function dedupeTeachersList(list: Teacher[]): { teachers: Teacher[]; idRemap: Re
   return unifyTeachers(list);
 }
 
+/* ─── Karşılaştırma raporu çıktısı ─── */
+
+const REPORT_HEADERS = ['Tür', 'Gün', 'Saat', 'Sınıf', 'Öğretmen', 'Açıklama'];
+
+function reportTable(report: ValidationReport): string[][] {
+  return validationReportRows(report).map(r => [
+    r.kind, DAY_NUM_TO_LONG[r.day] ?? String(r.day), `${r.hour}. ders`, r.className, r.teacher, r.detail,
+  ]);
+}
+
+function exportValidationExcel(report: ValidationReport) {
+  const sheet = XLSX.utils.aoa_to_sheet([REPORT_HEADERS, ...reportTable(report)]);
+  sheet['!cols'] = [{ wch: 12 }, { wch: 11 }, { wch: 8 }, { wch: 10 }, { wch: 28 }, { wch: 80 }];
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, 'Karşılaştırma');
+  XLSX.writeFile(book, `Program_Karsilastirma_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function buildValidationPrintHtml(report: ValidationReport, schoolName?: string): string {
+  const body = reportTable(report)
+    .map(cells => `<tr>${cells.map(c => `<td>${escHtml(c)}</td>`).join('')}</tr>`)
+    .join('');
+  return `
+    <style>
+      .val-report { font-family: 'Segoe UI', Arial, sans-serif; color: #0f172a; }
+      .val-report h1 { font-size: 16px; margin: 0 0 8px; }
+      .val-report table { width: 100%; border-collapse: collapse; }
+      .val-report th, .val-report td { border: 1px solid #334155; padding: 4px 6px; text-align: left; font-size: 11px; vertical-align: top; }
+      .val-report th { background: #e2e8f0; }
+    </style>
+    <div class="val-report">
+      ${schoolName ? `<div>${escHtml(schoolName)}</div>` : ''}
+      <h1>Öğretmen–Sınıf Programı Karşılaştırma Raporu (${new Date().toLocaleDateString('tr-TR')})</h1>
+      <table>
+        <thead><tr>${REPORT_HEADERS.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
+}
+
 /* ─── Schedule Table Component ─── */
 
 function ScheduleTable({
@@ -671,6 +714,7 @@ export default function SchedulesTab({
   const [selectedClassId, setSelectedClassId] = useState<string>('');
   const [validationReport, setValidationReport] = useState<ValidationReport | null>(null);
   const [showValidation, setShowValidation] = useState(false);
+  const [reportPrintHtml, setReportPrintHtml] = useState<string | null>(null);
   const [checkedTeacherIds, setCheckedTeacherIds] = useState<Set<string>>(new Set());
   const [checkedClassIds, setCheckedClassIds] = useState<Set<string>>(new Set());
   const [editMode, setEditMode] = useState(false);
@@ -1318,7 +1362,25 @@ export default function SchedulesTab({
                     </details>
                   )}
 
-                  <div className="flex justify-end pt-2">
+                  <div className="flex flex-wrap justify-end items-center gap-4 pt-2">
+                    {totalProblems + classNotFound > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => exportValidationExcel(validationReport)}
+                          className="text-sm text-emerald-700 hover:text-emerald-900 flex items-center gap-1.5"
+                        >
+                          <FileSpreadsheet className="w-4 h-4" /> Excel'e aktar
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setReportPrintHtml(buildValidationPrintHtml(validationReport, schoolInfo.okulAdi))}
+                          className="text-sm text-indigo-700 hover:text-indigo-900 flex items-center gap-1.5"
+                        >
+                          <Printer className="w-4 h-4" /> Yazdır
+                        </button>
+                      </>
+                    )}
                     <button
                       onClick={() => { setShowValidation(false); setValidationReport(null); }}
                       className="text-sm text-slate-500 hover:text-slate-700 transition-colors"
@@ -1331,6 +1393,15 @@ export default function SchedulesTab({
             })()}
           </div>
         </div>
+      )}
+
+      {reportPrintHtml && (
+        <PrintPreview
+          title="Program karşılaştırma raporu"
+          html={reportPrintHtml}
+          page="landscape"
+          onClose={() => setReportPrintHtml(null)}
+        />
       )}
 
       {/* Schedule Viewer */}

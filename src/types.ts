@@ -117,7 +117,7 @@ export interface ScheduleConfig {
   activeDays: number[]; // 1=Mon, 2=Tue, ..., 5=Fri
 }
 
-export type DutyChangeReason = 'rapor' | 'izin' | 'toplanti' | 'ders' | 'idari';
+export type DutyChangeReason = 'rapor' | 'izin' | 'toplanti' | 'ders' | 'idari' | 'takas';
 
 export const DUTY_CHANGE_REASONS: { id: DutyChangeReason; label: string }[] = [
   { id: 'rapor', label: 'Rapor' },
@@ -125,6 +125,7 @@ export const DUTY_CHANGE_REASONS: { id: DutyChangeReason; label: string }[] = [
   { id: 'toplanti', label: 'Toplantı' },
   { id: 'ders', label: 'Ders değişikliği' },
   { id: 'idari', label: 'İdari karar' },
+  { id: 'takas', label: 'Öğretmen takas isteği' },
 ];
 
 export interface DutyChange {
@@ -137,6 +138,27 @@ export interface DutyChange {
   fromTeacherId: string;
   toTeacherId?: string;
   reason: DutyChangeReason;
+}
+
+export type SwapRequestStatus = 'pending' | 'approved' | 'rejected' | 'cancelled';
+
+/** Öğretmenin nöbetini başka bir öğretmene devretme ya da karşılıklı değiştirme isteği. */
+export interface SwapRequest {
+  id: string;
+  createdAt: string;
+  requesterId: string;
+  assignmentId: string;
+  date: string;
+  locationId: string;
+  targetTeacherId: string;
+  /** Karşılıklı takasta hedef öğretmenin vereceği nöbet; yoksa nöbet devredilir. */
+  targetAssignmentId?: string;
+  targetDate?: string;
+  targetLocationId?: string;
+  note?: string;
+  status: SwapRequestStatus;
+  decidedAt?: string;
+  decisionNote?: string;
 }
 
 export type AbsenceReason = 'mazeret' | 'rapor' | 'gorevliIzinli' | 'diger';
