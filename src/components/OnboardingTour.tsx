@@ -121,8 +121,8 @@ const STEPS: Step[] = [
     tabId: 'schedule',
     body: (
       <>
-        Aynı öğretmenin aynı gün iki nöbeti olduğunda hücreyi tıklayıp <strong>Çift Nöbet</strong>{' '}
-        olarak işaretleyin; PDF çıktısına otomatik bir not düşülür. <strong>PDF Renk</strong>{' '}
+        Aynı öğretmenin aynı hafta farklı bir günde ikinci nöbeti olduğunda hücreyi tıklayıp <strong>Çift Nöbet</strong>{' '}
+        olarak işaretleyin; PDF çıktısına otomatik bir not düşülür. Aynı güne iki alan yazılmaz. <strong>PDF Renk</strong>{' '}
         butonundan satır zebra rengini Mavi/Yeşil/Mor/Sarı arasında seçebilirsiniz.
       </>
     ),
@@ -208,6 +208,11 @@ export default function OnboardingTour({ open, onClose, onTabChange }: Props) {
 
   const handleFinish = () => {
     try { localStorage.setItem(ONBOARDING_STORAGE_KEY, '1'); } catch {}
+    // Electron'da kurulum bazında kalıcı bayrak (sunucu adresi/origin değişse de kalır).
+    try {
+      (window as Window & { electronAPI?: { markOnboardingDone?: () => void } })
+        .electronAPI?.markOnboardingDone?.();
+    } catch {}
     onClose();
   };
 

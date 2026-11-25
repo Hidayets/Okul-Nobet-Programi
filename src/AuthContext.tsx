@@ -11,7 +11,7 @@ interface AuthContextType {
   actingKurumKodu: string | null;
   setActingKurumKodu: (kurumKodu: string | null) => void;
   /** Lisansı pasif/expired bulunup oturum sonlandırıldığında set edilir. */
-  licenseLockout: { reason: 'inactive' | 'expired'; message: string } | null;
+  licenseLockout: { reason: 'inactive' | 'expired'; message: string; kurumKodu?: string } | null;
   signOut: () => Promise<void>;
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   setLicense: React.Dispatch<React.SetStateAction<LicenseSummary | null>>;
@@ -43,7 +43,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [loading, setLoading] = useState(true);
   const [actingKurumKodu, setActingKurumKoduState] = useState<string | null>(() => getActingKurumKodu());
   const [licenseLockout, setLicenseLockout] = useState<
-    { reason: 'inactive' | 'expired'; message: string } | null
+    { reason: 'inactive' | 'expired'; message: string; kurumKodu?: string } | null
   >(null);
 
   // En son fetch sonucunu izleyebilmek için ref
@@ -95,6 +95,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (data?.licenseStatus === 'inactive' || data?.licenseStatus === 'expired') {
             setLicenseLockout({
               reason: data.licenseStatus,
+              kurumKodu: userRef.current?.kurumKodu,
               message:
                 data.error ||
                 (data.licenseStatus === 'inactive'

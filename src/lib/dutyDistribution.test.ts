@@ -68,10 +68,10 @@ describe('dutyDistribution', () => {
 
     // 'a' loc1 için havuzda kalsa bile seçilemez; kalan tek aday 'b' döner.
     expect(pickTeacherForSlot([a, b], state, assignedToday, 'loc1', '2026-03', 1)?.id).toBe('b');
-    // Havuzda yalnızca o yere atanmış öğretmen varsa sonuç boş olur (mükerrer atama yapılmaz).
+    // Havuzda yalnızca o gün nöbeti olan öğretmen varsa sonuç boş olur.
     expect(pickTeacherForSlot([a], state, assignedToday, 'loc1', '2026-03', 1)).toBeNull();
-    // Aynı gün farklı bir yerde (loc2) görev yapabilir.
-    expect(pickTeacherForSlot([a], state, assignedToday, 'loc2', '2026-03', 1)?.id).toBe('a');
+    // Aynı gün farklı bir yerde de görev yapamaz.
+    expect(pickTeacherForSlot([a], state, assignedToday, 'loc2', '2026-03', 1)).toBeNull();
   });
 
   it('prefers the teacher whose fixed duty day is today', () => {
@@ -112,14 +112,12 @@ describe('dutyDistribution', () => {
     expect(pickTeacherForSlot([a, b], state, new Set(), 'loc1', '2026-03', 4, '2026-03-05')?.id).toBe('b');
   });
 
-  it('gives a second same-day duty only to multi-location teachers at another location', () => {
+  it('never gives a second duty on the same day, even at another location', () => {
     const assignedToday = new Set<string>();
     markAssignedToday(assignedToday, 'a', 'loc1');
     expect(canTakeSlotToday('a', 'loc2', assignedToday, 1)).toBe(false);
     expect(canTakeSlotToday('a', 'loc1', assignedToday, 2)).toBe(false);
-    expect(canTakeSlotToday('a', 'loc2', assignedToday, 2)).toBe(true);
-    markAssignedToday(assignedToday, 'a', 'loc2');
-    expect(canTakeSlotToday('a', 'loc3', assignedToday, 2)).toBe(false);
+    expect(canTakeSlotToday('a', 'loc2', assignedToday, 2)).toBe(false);
     expect(canTakeSlotToday('b', 'loc1', assignedToday, 0)).toBe(true);
   });
 
@@ -131,7 +129,7 @@ describe('dutyDistribution', () => {
     const hasHome = (id: string) => id !== 'c';
     expect(preferSlotPool([a, b, c], assignedToday, hasHome).map(t => t.id)).toEqual(['b']);
     expect(preferSlotPool([a, c], assignedToday, hasHome).map(t => t.id)).toEqual(['c']);
-    expect(preferSlotPool([a], assignedToday, hasHome).map(t => t.id)).toEqual(['a']);
+    expect(preferSlotPool([a], assignedToday, hasHome)).toEqual([]);
   });
 
   it('computeLocationDistribution groups by teacher and location', () => {

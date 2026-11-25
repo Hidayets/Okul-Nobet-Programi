@@ -1,8 +1,9 @@
 import { Fragment, useState, useMemo } from 'react';
 import { format, parseISO } from 'date-fns';
 import { tr } from 'date-fns/locale';
-import { BarChart3, Printer, UserX } from 'lucide-react';
+import { BarChart3, FileSpreadsheet, Printer, UserX } from 'lucide-react';
 import PrintPreview, { capturePrintHtml } from './PrintPreview';
+import { downloadExcel } from '../lib/downloadExcel';
 import { Teacher, Absence, SchoolInfo, ABSENCE_REASONS, AbsenceReason, formatAcademicYear } from '../types';
 
 interface Props {
@@ -71,6 +72,44 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
       { total: 0, mazeret: 0, rapor: 0, gorevliIzinli: 0, diger: 0, unspecified: 0 }
     );
   }, [summaryData]);
+
+  const handleDownload = () => {
+    if (summaryData.length === 0) return;
+    const reasonHeaders = ABSENCE_REASONS.map((r) => r.label);
+    const summaryRows: (string | number)[][] = [
+      [okulAdi || 'Devamsızlık takip', yearLabel],
+      [],
+      ['#', 'Öğretmen', 'Toplam', ...reasonHeaders, 'Belirtilmemiş'],
+      ...summaryData.map((item, i) => [
+        i + 1,
+        item.teacher.name,
+        item.total,
+        item.mazeret || 0,
+        item.rapor || 0,
+        item.gorevliIzinli || 0,
+        item.diger || 0,
+        item.unspecified || 0,
+      ]),
+      ['', 'TOPLAM', totals.total, totals.mazeret, totals.rapor, totals.gorevliIzinli, totals.diger, totals.unspecified],
+    ];
+    const detailRows: (string | number)[][] = [
+      ['Öğretmen', 'Tarih', 'Sebep'],
+      ...summaryData.flatMap((item) =>
+        item.details
+          .slice()
+          .sort((a, b) => a.date.localeCompare(b.date))
+          .map((detail) => [
+            item.teacher.name,
+            format(parseISO(detail.date), 'dd.MM.yyyy'),
+            ABSENCE_REASONS.find((r) => r.id === detail.reason)?.label || 'Belirtilmemiş',
+          ]),
+      ),
+    ];
+    downloadExcel(`Devamsizlik_Takip_${activeYear}.xlsx`, [
+      { name: 'Özet', rows: summaryRows, colWidths: [6, 32, 10, 14, 12, 16, 12, 16] },
+      { name: 'Ayrıntı', rows: detailRows, colWidths: [32, 14, 20] },
+    ]);
+  };
 
   const handlePrint = () => {
     const html = capturePrintHtml('.absence-print-section');
@@ -162,14 +201,24 @@ export default function AbsenceTrackingTab({ teachers, absences, schoolInfo, act
           <h2 className="text-xl font-semibold text-slate-800">Devamsızlık Takip</h2>
           <p className="text-sm text-slate-500 mt-1">{yearLabel} — {summaryData.length} öğretmen, toplam {totals.total} gün devamsızlık</p>
         </div>
-        <button
-          onClick={handlePrint}
-          disabled={summaryData.length === 0}
-          className="bg-surface border border-slate-300 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors shadow-sm disabled:opacity-50"
-        >
-          <Printer className="w-4 h-4" />
-          Yazdır
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handlePrint}
+            disabled={summaryData.length === 0}
+            className="bg-surface border border-slate-300 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors shadow-sm disabled:opacity-50"
+          >
+            <Printer className="w-4 h-4" />
+            Yazdır
+          </button>
+          <button
+            onClick={handleDownload}
+            disabled={summaryData.length === 0}
+            className="bg-surface border border-slate-300 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors shadow-sm disabled:opacity-50"
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            Excel
+          </button>
+        </div>
       </div>
 
       {/* Summary cards */}

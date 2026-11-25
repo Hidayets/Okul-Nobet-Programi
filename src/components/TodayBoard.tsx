@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { addDays, format, parseISO } from 'date-fns';
 import { tr } from 'date-fns/locale';
-import { CalendarClock, ChevronLeft, ChevronRight, Printer } from 'lucide-react';
+import { CalendarClock, ChevronLeft, ChevronRight, FileSpreadsheet, Printer } from 'lucide-react';
 import PrintPreview from './PrintPreview';
+import { downloadExcel } from '../lib/downloadExcel';
 import { Absence, Assignment, Location, Substitution, Teacher } from '../types';
 import { buildDayBoard } from '../lib/dayBoard';
 
@@ -42,6 +43,34 @@ export default function TodayBoard({
   const vp = vicePrincipalName?.(date);
   const parsed = parseISO(date);
   const heading = format(parsed, 'd MMMM yyyy EEEE', { locale: tr });
+
+  const downloadBoard = () => {
+    const dutyRows: (string | number)[][] = [
+      [schoolName || 'Günün panosu', heading],
+      ...(dutyHours ? [['Nöbet saati', dutyHours]] : []),
+      ...(vp ? [['Nöbetçi müdür yardımcısı', vp]] : []),
+      [],
+      ['Yer', 'Öğretmen', 'Durum'],
+      ...(board.duties.length
+        ? board.duties.map((row) => [row.locationName, row.teacherName, row.status])
+        : [['Bu gün için nöbet ataması yok', '', '']]),
+    ];
+    const absenceRows: (string | number)[][] = [
+      ['Öğretmen', 'Açıklama'],
+      ...(board.absences.length
+        ? board.absences.map((row) => [row.teacherName, row.detail])
+        : [['Devamsız yok', '']]),
+    ];
+    const coverRows: (string | number)[][] = [
+      ['Görevlendirme'],
+      ...(board.covers.length ? board.covers.map((row) => [row]) : [['Görevlendirme yok']]),
+    ];
+    downloadExcel(`Gunun_Panosu_${date}.xlsx`, [
+      { name: 'Nöbet', rows: dutyRows, colWidths: [28, 32, 24] },
+      { name: 'Devamsızlar', rows: absenceRows, colWidths: [32, 40] },
+      { name: 'Derse girenler', rows: coverRows, colWidths: [48] },
+    ]);
+  };
 
   const openPrint = () => {
     const dutyRows = board.duties.map((row) => `
@@ -110,6 +139,9 @@ export default function TodayBoard({
           )}
           <button type="button" className="app-btn app-btn-blue" onClick={openPrint}>
             <Printer className="w-4 h-4" /> Yazdır
+          </button>
+          <button type="button" className="app-btn app-btn-green-outline" onClick={downloadBoard}>
+            <FileSpreadsheet className="w-4 h-4" /> Excel
           </button>
         </div>
       </div>

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Building2, KeyRound, UserCircle2, Loader2, ArrowLeft, CheckCircle2, Shield, UploadCloud } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import { describeImport, hasLocalDatabaseToMigrate, readLocalDatabase, uploadKurumDatabase } from '../lib/migrateUpload';
+import LicenseContactDialog, { CONTACT_EMAIL } from './LicenseContactDialog';
 
 interface Props {
   onSwitchToRegister: () => void;
@@ -14,6 +15,7 @@ export default function Login({ onSwitchToRegister }: Props) {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [licenseNotice, setLicenseNotice] = useState<{ reason: 'expired' | 'inactive'; message: string; kurumKodu: string } | null>(null);
   
   // Özel giriş modu
   const [showSuperAdmin, setShowSuperAdmin] = useState(false);
@@ -144,6 +146,7 @@ export default function Login({ onSwitchToRegister }: Props) {
 
     setLoading(true);
     setError('');
+    setLicenseNotice(null);
 
     try {
       const res = await fetch('/api/auth/login', {
@@ -166,6 +169,9 @@ export default function Login({ onSwitchToRegister }: Props) {
         setLicense(data.license || null);
       } else {
         setError(data.error || 'Giriş yapılırken bir hata oluştu.');
+        if (data.licenseStatus === 'expired' || data.licenseStatus === 'inactive') {
+          setLicenseNotice({ reason: data.licenseStatus, message: data.error || '', kurumKodu: cleanKurumKodu });
+        }
       }
     } catch (err: any) {
       console.error('Login error:', err);
@@ -475,6 +481,9 @@ export default function Login({ onSwitchToRegister }: Props) {
             {error && (
               <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-lg text-sm">
                 {error}
+                {licenseNotice === null && /lisans/i.test(error) && (
+                  <> İletişim: <a href={`mailto:${CONTACT_EMAIL}`} className="font-semibold underline">{CONTACT_EMAIL}</a></>
+                )}
               </div>
             )}
 
@@ -560,6 +569,9 @@ export default function Login({ onSwitchToRegister }: Props) {
                 Şifremi Unuttum
               </button>
             </div>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Başka bir bilgisayardan girmek için o bilgisayarda kurulumda Bağlanan Bilgisayar seçilir ve ana bilgisayarın adresi yazılır. Aynı kurum kodu ve şifre hem yönetici hem öğretmen hesabında geçerlidir. Ana bilgisayar açık kalmalıdır.
+            </p>
           </form>
 
           <div className="mt-4 border-t border-slate-200 pt-4">
@@ -646,6 +658,15 @@ export default function Login({ onSwitchToRegister }: Props) {
           © {new Date().getFullYear()} Hidayet SEVDİ
         </p>
       </div>
+
+      {licenseNotice && (
+        <LicenseContactDialog
+          reason={licenseNotice.reason}
+          message={licenseNotice.message}
+          kurumKodu={licenseNotice.kurumKodu}
+          onClose={() => setLicenseNotice(null)}
+        />
+      )}
     </div>
   );
 }

@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { AlertTriangle, Mail, X, Calendar, Copy } from 'lucide-react';
 import { LicenseSummary } from '../types';
 import { formatLicenseDateLongTr } from '../lib/licenseDates';
+import { CONTACT_EMAIL } from './LicenseContactDialog';
 
 interface Props {
   license: LicenseSummary | null;
@@ -9,8 +10,6 @@ interface Props {
   thresholdDays?: number;
   onDismiss: () => void;
 }
-
-const CONTACT_EMAIL = 'okulcozumleri@gmail.com';
 
 export default function LicenseExpiryWarning({
   license,

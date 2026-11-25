@@ -13,8 +13,9 @@
  */
 
 import { execSync, spawnSync } from 'child_process';
+import { createRequire } from 'module';
 import {
-  cpSync, mkdirSync, rmSync, writeFileSync, renameSync,
+  cpSync, mkdirSync, rmSync, writeFileSync,
   existsSync, readFileSync, copyFileSync, readdirSync, statSync
 } from 'fs';
 import path from 'path';
@@ -96,6 +97,24 @@ function copyDirRobust(src, dest) {
   }
 }
 
+// ─── 0. Lisans sırrı ─────────────────────────────────────────────────────────
+// Paketlenen sunucuya gömülür; .env (git'e girmez) ya da ortam değişkeninden okunur.
+const LEGACY_LICENSE_SECRET = 'okul-nobet-2025-BURAYA-KENDI-GIZLI-ANAHTARINIZI-YAZIN';
+function readLicenseSecret() {
+  const fromEnv = String(process.env.LICENSE_SECRET || '').trim();
+  if (fromEnv) return fromEnv;
+  const envFile = path.join(ROOT, '.env');
+  if (!existsSync(envFile)) return '';
+  const line = readFileSync(envFile, 'utf8').split(/\r?\n/).find(l => /^\s*LICENSE_SECRET\s*=/.test(l));
+  return line ? line.slice(line.indexOf('=') + 1).trim().replace(/^["']|["']$/g, '') : '';
+}
+const licenseSecret = readLicenseSecret();
+if (!/^[A-Za-z0-9_-]{24,}$/.test(licenseSecret) || licenseSecret === LEGACY_LICENSE_SECRET) {
+  console.error('HATA: .env içinde geçerli bir LICENSE_SECRET yok (en az 24 karakter, harf/rakam).');
+  console.error('      Bu sır olmadan paketlenen sürüm yeni okul kayıtlarını kabul etmez.');
+  process.exit(1);
+}
+
 // ─── 1. Frontend Build ───────────────────────────────────────────────────────
 console.log('\n═══ Adım 1: Frontend derleniyor (vite build)…');
 run('npm run build');
@@ -104,13 +123,29 @@ run('npm run build');
 console.log('\n═══ Adım 2: Server esbuild ile derleniyor…');
 mkdirRobust(TMP);
 
-run(
-  `npx esbuild server.ts ` +
-  `--bundle --platform=node --format=cjs --target=node22 ` +
-  `--define:process.env.NODE_ENV='"production"' ` +
-  `--external:better-sqlite3 --external:lightningcss --external:vite ` +
-  `--outfile=${path.join(TMP, 'server.cjs')}`
-);
+// Kabuk tırnakları sırrı bozmasın diye esbuild JS API kullanılır.
+console.log('\n> esbuild server.ts --define:__BUILD_LICENSE_SECRET__=***\n');
+const esbuild = createRequire(import.meta.url)('esbuild');
+esbuild.buildSync({
+  entryPoints: [path.join(ROOT, 'server.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node22',
+  define: {
+    'process.env.NODE_ENV': '"production"',
+    __BUILD_LICENSE_SECRET__: JSON.stringify(licenseSecret),
+  },
+  external: ['better-sqlite3', 'lightningcss', 'vite'],
+  outfile: path.join(TMP, 'server.cjs'),
+  absWorkingDir: ROOT,
+});
+esbuild.stop();
+const bundledServer = readFileSync(path.join(TMP, 'server.cjs'), 'utf8');
+if (!bundledServer.includes(JSON.stringify(licenseSecret))) {
+  console.error('HATA: Lisans sırrı sunucu paketine gömülemedi.');
+  process.exit(1);
+}
 
 // ─── 3. Giriş noktası: better-sqlite3 native hook ────────────────────────────
 console.log('\n═══ Adım 3: pkg giriş noktası (native module hook) oluşturuluyor…');
@@ -162,7 +197,8 @@ try {
   console.warn('⚠ İndirme başarısız; sertifika iptal kontrolü atlanarak yeniden deneniyor…');
   execSync(`curl.exe -L --fail --ssl-no-revoke -o "${sqliteGz}" "${sqliteUrl}"`, { stdio: 'inherit' });
 }
-execSync(`tar -xzf "${sqliteGz}" -C "${sqliteTmp}"`, { stdio: 'inherit' });
+// tar'ı sqliteTmp dizininden çalıştırarak yol sorununu çöz
+execSync('tar -xzf better-sqlite3.tar.gz', { stdio: 'inherit', cwd: sqliteTmp });
 const sqliteNode = path.join(sqliteTmp, 'build', 'Release', 'better_sqlite3.node');
 if (!existsSync(sqliteNode)) {
   console.error('HATA: Node 22 better_sqlite3.node paketin içinde yok.');
@@ -210,27 +246,17 @@ try {
 
 // ─── 7. Electron-builder ile installer oluştur ──────────────────────────────
 console.log('\n═══ Adım 7: Electron-builder ile kurulum paketi oluşturuluyor…');
-// electron-builder ara çıktısı package.json → build.directories.output'a yazılır
-// (EB_OUTPUT_DIR ile değiştirilebilir); kurulum dosyaları sonra proje köküne taşınır.
-// Çıktı klasörü proje kökü yapılamaz: electron-builder onu paket dosyalarından hariç tutar.
+// Kurulum dosyaları (Setup .exe, .blockmap, latest.yml) doğrudan release/ klasörüne yazılır.
 const rootPkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 const ebOutput = path.resolve(ROOT, process.env.EB_OUTPUT_DIR || rootPkg.build?.directories?.output || 'release');
-const PACKAGE_DIR = ROOT;
-const isInstallerArtifact = (name) =>
-  /^OkulNobetProgrami-Setup-.+\.exe(\.blockmap)?$/.test(name) || name === 'latest.yml';
+const PACKAGE_DIR = ebOutput;
 try {
-  run(`npx electron-builder --win --config -c.directories.output="${ebOutput}"`);
-  for (const name of readdirSync(ebOutput).filter(isInstallerArtifact)) {
-    const src = path.join(ebOutput, name);
-    const dest = path.join(PACKAGE_DIR, name);
-    rmSync(dest, { force: true });
-    try {
-      renameSync(src, dest);
-    } catch {
-      copyFileSync(src, dest);
-      rmSync(src, { force: true });
-    }
-  }
+  // --publish never: electron-builder CI ortamı algıladığında örtük olarak
+  // GitHub'a yayınlamaya çalışır ve GH_TOKEN olmadığı için sıfırdan farklı
+  // çıkış kodu döndürür. Bu da installer dosyalarının üretilmesini ve
+  // latest.yml üretimini engeller. Yayınlamayı açıkça kapatıyoruz; yükleme
+  // gerektiğinde ayrıca GH_TOKEN ile `electron-builder --publish always` çalıştırılır.
+  run(`npx electron-builder --win --config -c.directories.output="${ebOutput}" --publish never`);
   console.log(`\n✔ Electron installer oluşturuldu: ${PACKAGE_DIR}`);
 } catch (e) {
   console.error('⚠ electron-builder hatası:', e.message);

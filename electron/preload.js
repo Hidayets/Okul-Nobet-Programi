@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   printPdf: (opts) => ipcRenderer.invoke('print-pdf', opts),
+  listPrinters: () => ipcRenderer.invoke('printers:list'),
+  openPrinterProperties: (deviceName) => ipcRenderer.invoke('printer:properties', deviceName),
 
   // Update sistem
   onUpdateStatus: (callback) => {
@@ -14,6 +16,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Uygulama bilgileri
   getAppInfo: () => ipcRenderer.invoke('app:get-info'),
+  reconfigureConnection: () => ipcRenderer.invoke('connection:reconfigure'),
+  // Tanıtım turu: yalnızca ilk kurulumda gösterilir (kurulum bazında kalıcı bayrak)
+  isOnboardingDone: () => ipcRenderer.invoke('onboarding:is-done'),
+  markOnboardingDone: () => ipcRenderer.invoke('onboarding:mark-done'),
+  // Windows'ta alert/confirm sonrası yazı alanlarının kilitlenmesini önler
+  showAlertSync: (message) => ipcRenderer.sendSync('dialog:alert-sync', String(message ?? '')),
+  showConfirmSync: (message) => !!ipcRenderer.sendSync('dialog:confirm-sync', String(message ?? '')),
+  restoreFocus: () => ipcRenderer.sendSync('window:restore-focus'),
 
   // Veritabanı yedekleme
   createBackup: () => ipcRenderer.invoke('backup:create'),

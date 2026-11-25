@@ -43,6 +43,8 @@ export interface ArrangeOptions {
   dayOk: (teacherId: string, slot: StaircaseSlot) => boolean;
   /** Öğretmenin atandığı yer kuralına uyuyor mu (mevcuttan kötüye gidilmez) */
   homeOk: (teacherId: string, slot: StaircaseSlot) => boolean;
+  /** İkinci nöbetin yazılabileceği yerler. Boşsa kısıt yoktur. */
+  extraDutyPlaceIds?: string[];
 }
 
 export function staircaseScore(teacherId: string, slot: StaircaseSlot, opts: ArrangeOptions): number {
@@ -84,7 +86,21 @@ export function arrangeStaircaseWeek(slots: StaircaseSlot[], opts: ArrangeOption
     if (!opts.dayOk(teacherId, to)) return false;
     if (!opts.homeOk(teacherId, to) && opts.homeOk(teacherId, from)) return false;
     if (busyAt(teacherId, to, except)) return false;
-    if (from.dateStr !== to.dateStr && slotsOnDate(teacherId, to.dateStr, except) > 0) return false;
+    if (slotsOnDate(teacherId, to.dateStr, except) > 0) return false;
+    const extraIds = opts.extraDutyPlaceIds;
+    if (extraIds && extraIds.length > 0) {
+      const dates = [to.dateStr];
+      for (let k = 0; k < n; k++) {
+        if (except.includes(k)) continue;
+        if (result[k].teacherId === teacherId) dates.push(result[k].dateStr);
+      }
+      if (new Set(dates).size > 1) {
+        const preferred = opts.preferredDayOf(teacherId);
+        const earliest = [...dates].sort()[0];
+        const isExtra = typeof preferred === 'number' ? to.dayOfWeek !== preferred : to.dateStr !== earliest;
+        if (isExtra && !extraIds.includes(to.locationId)) return false;
+      }
+    }
     return true;
   };
 

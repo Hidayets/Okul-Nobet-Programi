@@ -6,6 +6,8 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { formatAcademicYear } from '../types';
+import { shareAccessText } from '../lib/lanAddresses';
+import { useShareAddress } from '../hooks/useShareAddress';
 import { UpdateStatus } from './UpdateNotifier';
 
 export type AppTab =
@@ -38,6 +40,8 @@ interface Props {
   isAdmin: boolean;
   isSuperAdmin: boolean;
   user: { kurumKodu: string; role: string };
+  schoolName?: string;
+  teacherName?: string;
   onSignOut: () => void;
   onTourOpen: () => void;
   onCheckUpdate: () => void;
@@ -60,6 +64,8 @@ export default function AppShell({
   isAdmin,
   isSuperAdmin,
   user,
+  schoolName = '',
+  teacherName = '',
   onSignOut,
   onTourOpen,
   onCheckUpdate,
@@ -116,6 +122,9 @@ export default function AppShell({
     updateStatus.status === 'available' || updateStatus.status === 'downloading';
 
   const roleLabel = isSuperAdmin ? 'Yönetici' : isAdmin ? 'Admin' : 'Öğretmen';
+  const institutionName = schoolName.trim() || user.kurumKodu;
+  const shownName = user.role === 'teacher' && teacherName.trim() ? teacherName.trim() : roleLabel;
+  const shareAddresses = useShareAddress(!isSuperAdmin);
 
   return (
     <div className="app-shell min-h-screen flex print:block">
@@ -150,6 +159,23 @@ export default function AppShell({
               role="menu"
               className="absolute bottom-full left-2 right-2 mb-1 z-50 rounded-xl bg-surface shadow-xl border border-slate-200 py-1 text-sm text-slate-700"
             >
+              <div className="px-3.5 py-2.5 border-b border-slate-100">
+                <div className="text-[11px] uppercase tracking-wide text-slate-400">Kurum</div>
+                <div className="font-semibold text-slate-800 break-words">{institutionName}</div>
+                {user.role === 'teacher' && (
+                  <>
+                    <div className="text-[11px] uppercase tracking-wide text-slate-400 mt-2">Öğretmen</div>
+                    <div className="font-semibold text-slate-800 break-words">
+                      {teacherName.trim() || 'Adınızı ana sayfadaki listeden seçin'}
+                    </div>
+                  </>
+                )}
+                {!isSuperAdmin && (
+                  <p className="mt-2 text-[11px] leading-snug text-slate-500">
+                    {shareAccessText(shareAddresses)}
+                  </p>
+                )}
+              </div>
               <button
                 type="button"
                 role="menuitem"
@@ -186,8 +212,8 @@ export default function AppShell({
               <Users className="w-4 h-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-[11px] text-blue-300/80">Kullanıcı</div>
-              <div className="text-sm font-semibold text-white truncate">{roleLabel}</div>
+              <div className="text-[11px] text-blue-300/80 truncate">{institutionName}</div>
+              <div className="text-sm font-semibold text-white truncate">{shownName}</div>
             </div>
             <ChevronUp
               className={cn('w-4 h-4 text-blue-200/70 transition-transform', !userMenuOpen && 'rotate-180')}

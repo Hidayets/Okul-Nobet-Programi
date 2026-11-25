@@ -42,35 +42,21 @@ export interface DutyScheduleExcelParams {
   yearLabel?: string;
 }
 
-const HEADER_FILL: ExcelJS.Fill = {
-  type: 'pattern',
-  pattern: 'solid',
-  fgColor: { argb: 'FF1A4A8A' },
-};
-
-const HOLIDAY_FILL: ExcelJS.Fill = {
-  type: 'pattern',
-  pattern: 'solid',
-  fgColor: { argb: 'FFFDE8E8' },
-};
-
-const WEEK_FILL: ExcelJS.Fill = {
-  type: 'pattern',
-  pattern: 'solid',
-  fgColor: { argb: 'FFEFF6FF' },
-};
-
-const ZEBRA_FILL: ExcelJS.Fill = {
-  type: 'pattern',
-  pattern: 'solid',
-  fgColor: { argb: 'FFF8FAFC' },
-};
+const black = { argb: 'FF000000' };
 
 const thinBorder: ExcelJS.Borders = {
-  top: { style: 'thin', color: { argb: 'FF94A3B8' } },
-  left: { style: 'thin', color: { argb: 'FF94A3B8' } },
-  bottom: { style: 'thin', color: { argb: 'FF94A3B8' } },
-  right: { style: 'thin', color: { argb: 'FF94A3B8' } },
+  top: { style: 'thin', color: black },
+  left: { style: 'thin', color: black },
+  bottom: { style: 'thin', color: black },
+  right: { style: 'thin', color: black },
+  diagonal: undefined,
+};
+
+const weekBorder: ExcelJS.Borders = {
+  top: { style: 'medium', color: black },
+  left: { style: 'thin', color: black },
+  bottom: { style: 'medium', color: black },
+  right: { style: 'thin', color: black },
   diagonal: undefined,
 };
 
@@ -98,7 +84,7 @@ function centeredTitleCell(
 ) {
   const cell = ws.getCell(row, 1);
   cell.value = value;
-  cell.font = { bold: opts?.bold ?? true, size: opts?.size ?? 10, color: { argb: 'FF1F2937' } };
+  cell.font = { bold: opts?.bold ?? true, size: opts?.size ?? 10, color: { argb: 'FF000000' } };
   cell.alignment = { horizontal: 'center', vertical: 'middle' };
   if (colEnd > 1) ws.mergeCells(row, 1, row, colEnd);
 }
@@ -158,8 +144,7 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
   ws.getCell(headerRowIdx, totalCols).value = 'Nöbetçi Md. Yrd.';
   for (let c = 1; c <= totalCols; c++) {
     const cell = ws.getCell(headerRowIdx, c);
-    cell.font = { bold: true, size: 10, color: { argb: 'FFFFFFFF' } };
-    cell.fill = HEADER_FILL;
+    cell.font = { bold: true, size: 10, color: { argb: 'FF000000' } };
     cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
     cell.border = thinBorder;
   }
@@ -167,7 +152,7 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
 
   // --- Veri satırları ---
   let currentWeekNum: number | null = null;
-  rows.forEach((r, index) => {
+  rows.forEach((r) => {
     const parsed = parseISO(r.date);
     const weekNum = getISOWeek(parsed);
     
@@ -175,11 +160,13 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
     if (currentWeekNum === null || weekNum !== currentWeekNum) {
       currentWeekNum = weekNum;
       const weekLabelRow = rowIdx++;
-      centeredTitleCell(ws, weekLabelRow, totalCols, `${weekNum}. HAFTA`, { size: 11 });
+      centeredTitleCell(ws, weekLabelRow, totalCols, `${weekNum}. HAFTA`, { size: 14 });
       for (let c = 1; c <= totalCols; c++) {
         const cell = ws.getCell(weekLabelRow, c);
-        cell.fill = WEEK_FILL;
+        cell.font = { bold: true, size: 14, color: { argb: 'FF000000' } };
+        cell.border = weekBorder;
       }
+      ws.getRow(weekLabelRow).height = 22;
     }
 
     const dateText = format(parsed, 'dd.MM.yyyy');
@@ -197,8 +184,7 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
       }
       for (let c = 1; c <= totalCols; c++) {
         const cell = ws.getCell(hRow, c);
-        cell.font = { bold: true, size: 9, color: { argb: 'FFB91C1C' } };
-        cell.fill = HOLIDAY_FILL;
+        cell.font = { bold: true, size: 9, color: { argb: 'FF000000' } };
         cell.border = thinBorder;
       }
       ws.getRow(hRow).height = 22;
@@ -208,7 +194,7 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
     const dRow = rowIdx++;
     ws.getCell(dRow, 1).value = `${dateText}\n${dayName}`;
     ws.getCell(dRow, 1).alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
-    ws.getCell(dRow, 1).font = { size: 9, color: { argb: 'FF1F2937' } };
+    ws.getCell(dRow, 1).font = { size: 9, color: { argb: 'FF000000' } };
 
     locations.forEach((loc, i) => {
       const entries = scheduleData[r.date]?.[loc.id] ?? [];
@@ -218,21 +204,16 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
       const cell = ws.getCell(dRow, 2 + i);
       cell.value = names.length > 0 ? names.join('\n') : '-';
       cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
-      cell.font = { size: 9, color: { argb: 'FF1F2937' } };
+      cell.font = { size: 9, color: { argb: 'FF000000' } };
     });
 
     const vp = vpByDate[r.date];
     const vpCell = ws.getCell(dRow, totalCols);
     vpCell.value = vp?.name ?? '-';
     vpCell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
-    vpCell.font = { size: 9, color: { argb: 'FF1F2937' } };
+    vpCell.font = { size: 9, color: { argb: 'FF000000' } };
 
     applyBorderRange(ws, dRow, dRow, 1, totalCols, thinBorder);
-    if (index % 2 === 1) {
-      for (let c = 1; c <= totalCols; c++) {
-        ws.getCell(dRow, c).fill = ZEBRA_FILL;
-      }
-    }
     ws.getRow(dRow).height = 22;
   });
 
@@ -247,12 +228,12 @@ export async function exportDutyScheduleToExcel(params: DutyScheduleExcelParams)
   const sigTitleCell = ws.getCell(sigTitleRow, Math.max(1, totalCols - 1));
   sigTitleCell.value = 'Okul Müdürü';
   sigTitleCell.alignment = { horizontal: 'right', vertical: 'middle' };
-  sigTitleCell.font = { size: 9, color: { argb: 'FF374151' } };
+  sigTitleCell.font = { size: 9, color: { argb: 'FF000000' } };
 
   const sigNameCell = ws.getCell(sigNameRow, Math.max(1, totalCols - 1));
   sigNameCell.value = schoolInfo.okulMuduru ?? '';
   sigNameCell.alignment = { horizontal: 'right', vertical: 'middle' };
-  sigNameCell.font = { bold: true, size: 10, color: { argb: 'FF111827' } };
+  sigNameCell.font = { bold: true, size: 10, color: { argb: 'FF000000' } };
 
   const buffer = await workbook.xlsx.writeBuffer();
   const blob = new Blob([buffer], {

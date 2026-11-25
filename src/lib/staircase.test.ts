@@ -51,6 +51,20 @@ describe('staircase', () => {
     expect(arranged.find(s => s.teacherId === 't1')?.dayOfWeek).not.toBe(2);
   });
 
+  it('ikinci nöbeti işaretli yerin dışına kaydırmaz', () => {
+    const slots: StaircaseSlot[] = [
+      { dateStr: '2026-10-12', dayOfWeek: 1, locationId: 'A', teacherId: 't1' },
+      { dateStr: '2026-10-14', dayOfWeek: 3, locationId: 'B', teacherId: 't1' },
+      { dateStr: '2026-10-14', dayOfWeek: 3, locationId: 'C', teacherId: 't2' },
+    ];
+    const arranged = arrangeStaircaseWeek(slots, baseOpts({
+      targets: { t1: { dayIdx: 2, locIdx: 2 } },
+      preferredDayOf: id => (id === 't1' ? 1 : undefined),
+      extraDutyPlaceIds: ['B'],
+    }));
+    expect(arranged.find(s => s.teacherId === 't1' && s.dayOfWeek === 3)?.locationId).toBe('B');
+  });
+
   it('sabit nöbet gününü merdivene tercih eder', () => {
     const targets = { t1: staircaseTarget({ dayOfWeek: 1, locationId: 'A' }, days, ring) };
     const arranged = arrangeStaircaseWeek(week, baseOpts({

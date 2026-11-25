@@ -33,9 +33,9 @@ export interface Teacher {
   unavailableDays?: number[]; // Days of week teacher can't do duty (0=Sun, 1=Mon, ..., 5=Fri)
   /** Sabit nöbet günü: öğretmen bu gün nöbete öncelikli yazılır. */
   preferredDay?: number;
-  // Alternatif günler. preferredDay veya bu liste doluysa öğretmen SADECE
-  // preferredDay ve bu günlerde nöbet tutabilir.
-  // Boş/undefined ise kısıtlama yok (unavailableDays'in tersi yönde mantık).
+  // Alternatif günler: aynı haftada ikinci nöbet için. Sabit gün varken asıl nöbet
+  // preferredDay'dedir; bu günler ancak ek nöbet veya sabit günün o hafta tutulamaması için kullanılır.
+  // Yalnız bu liste doluysa öğretmen sadece bu günlerde tutar.
   availableDays?: number[];
   // schedule[dayOfWeek][hour] = className
   // dayOfWeek: 1 (Mon) to 5 (Fri)
@@ -87,6 +87,11 @@ export interface Location {
    * (sabit/hareketli) burada görevlendirilir.
    */
   assignedTeacherIds?: string[];
+  /**
+   * İşaretliyse aynı haftadaki ikinci ve sonraki nöbetler bu yere yazılabilir.
+   * Hiçbir yer işaretli değilse ikinci nöbet her yere gelebilir.
+   */
+  extraDutyPlace?: boolean;
 }
 
 /** Nöbet Yerleri sekmesindeki sıra; order alanı olmayan eski kayıtlar kayıt sırasını korur. */
@@ -106,7 +111,7 @@ export interface Assignment {
   originalTeacherId?: string;
   // Takas yapıldığında bağlantılı atama ID'si (karşılıklı takas için)
   swapPairId?: string;
-  // Öğretmen aynı gün/aynı yerde başka bir nöbeti varsa "çift nöbet" olarak işaretlenebilir.
+  // Öğretmenin aynı haftada, farklı bir günde ikinci nöbeti varsa işaretlenir.
   // PDF/print çıktısında ek bir not olarak gösterilir.
   isDoubleDuty?: boolean;
 }
@@ -117,7 +122,7 @@ export interface ScheduleConfig {
   activeDays: number[]; // 1=Mon, 2=Tue, ..., 5=Fri
 }
 
-export type DutyChangeReason = 'rapor' | 'izin' | 'toplanti' | 'ders' | 'idari' | 'takas';
+export type DutyChangeReason = 'rapor' | 'izin' | 'toplanti' | 'ders' | 'idari' | 'takas' | 'diger';
 
 export const DUTY_CHANGE_REASONS: { id: DutyChangeReason; label: string }[] = [
   { id: 'rapor', label: 'Rapor' },
@@ -126,6 +131,7 @@ export const DUTY_CHANGE_REASONS: { id: DutyChangeReason; label: string }[] = [
   { id: 'ders', label: 'Ders değişikliği' },
   { id: 'idari', label: 'İdari karar' },
   { id: 'takas', label: 'Öğretmen takas isteği' },
+  { id: 'diger', label: 'Diğer' },
 ];
 
 export interface DutyChange {

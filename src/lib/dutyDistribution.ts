@@ -87,9 +87,9 @@ export function compareTeachersForFairSlot(
   dayOfWeek: number,
   dateStr?: string,
 ): number {
-  // Aynı gün ikinci nöbet (çift nöbet) yalnız başka aday kalmadığında verilir.
-  const aToday = assignedToday.has(a.id) ? 1 : 0;
-  const bToday = assignedToday.has(b.id) ? 1 : 0;
+  // Aynı gün nöbeti olan öğretmen, başka aday varken seçilmez.
+  const aToday = teacherBusyToday(assignedToday, a.id) ? 1 : 0;
+  const bToday = teacherBusyToday(assignedToday, b.id) ? 1 : 0;
   if (aToday !== bToday) return aToday - bToday;
 
   const dayRankDiff = dayPreferenceRank(a, state, dayOfWeek, dateStr) - dayPreferenceRank(b, state, dayOfWeek, dateStr);
@@ -125,6 +125,15 @@ export function compareTeachersForFairSlot(
   return a.name.localeCompare(b.name, 'tr');
 }
 
+function teacherBusyToday(assignedToday: Set<string>, teacherId: string): boolean {
+  if (assignedToday.has(teacherId)) return true;
+  const prefix = `${teacherId}_`;
+  for (const key of assignedToday) {
+    if (key.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 export function pickTeacherForSlot(
   candidates: Teacher[],
   state: FairDistributionState,
@@ -136,9 +145,8 @@ export function pickTeacherForSlot(
 ): Teacher | null {
   if (candidates.length === 0) return null;
 
-  // Güvenlik kilidi: aynı gün aynı yerde aynı öğretmen ikinci kez atanmasın.
-  // assignedToday artık teacherId_locationId formatında
-  const pool = candidates.filter(t => !assignedToday.has(`${t.id}_${locationId}`));
+  // Aynı öğretmen aynı gün ikinci bir alana yazılmaz.
+  const pool = candidates.filter(t => !teacherBusyToday(assignedToday, t.id));
   if (pool.length === 0) return null;
 
   const sorted = [...pool].sort((a, b) =>
@@ -154,37 +162,30 @@ export function markAssignedToday(assignedToday: Set<string>, teacherId: string,
 }
 
 /**
- * Öğretmen bugün bu yere yazılabilir mi. Aynı gün ikinci nöbet yalnız birden fazla
- * nöbet yerine atanmış (çift nöbetli) öğretmene, farklı bir yerde ve atandığı yer sayısını aşmadan verilir.
+ * Öğretmen bugün bu yere yazılabilir mi. Aynı gün yalnızca bir alanda nöbet tutulur.
  */
 export function canTakeSlotToday(
   teacherId: string,
-  locationId: string,
+  _locationId: string,
   assignedToday: Set<string>,
-  homeCount: number,
+  _homeCount?: number,
 ): boolean {
-  if (!assignedToday.has(teacherId)) return true;
-  if (homeCount < 2 || assignedToday.has(`${teacherId}_${locationId}`)) return false;
-  const prefix = `${teacherId}_`;
-  let today = 0;
-  for (const key of assignedToday) if (key.startsWith(prefix)) today++;
-  return today < homeCount;
+  return !teacherBusyToday(assignedToday, teacherId);
 }
 
 /**
  * Aday havuzu önceliği: o gün nöbeti olmayan ve bu yere atanmış öğretmenler,
- * sonra o gün nöbeti olmayan diğerleri, en son çift nöbet alabilecekler.
+ * sonra o gün nöbeti olmayan diğerleri. Aynı güne ikinci alan yazılmaz.
  */
 export function preferSlotPool(
   candidates: Teacher[],
   assignedToday: Set<string>,
   hasHome: (teacherId: string) => boolean,
 ): Teacher[] {
-  const free = candidates.filter(t => !assignedToday.has(t.id));
+  const free = candidates.filter(t => !teacherBusyToday(assignedToday, t.id));
   const freeWithHome = free.filter(t => hasHome(t.id));
   if (freeWithHome.length > 0) return freeWithHome;
-  if (free.length > 0) return free;
-  return candidates;
+  return free;
 }
 
 export function recordDutyAssignment(

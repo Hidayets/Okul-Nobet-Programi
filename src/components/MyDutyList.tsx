@@ -6,6 +6,7 @@ import PrintPreview from './PrintPreview';
 import { formatSwapDuty } from './SwapRequestsPanel';
 import { Assignment, Holiday, Location, SwapRequest, Teacher, canTeacherDutyOnDay } from '../types';
 import { formatDutyWhatsAppText, DutyShareLine } from '../lib/dutyShareText';
+import { readMyTeacherId, writeMyTeacherId } from '../lib/myTeacher';
 
 interface Props {
   teachers: Teacher[];
@@ -65,23 +66,17 @@ export default function MyDutyList({
   swapRequests = [],
   setSwapRequests,
 }: Props) {
-  const storageKey = `nobet-my-teacher:${kurumKodu || 'okul'}`;
-  const [teacherId, setTeacherId] = useState(() => {
-    try { return localStorage.getItem(storageKey) || ''; } catch { return ''; }
-  });
+  const [teacherId, setTeacherId] = useState(() => readMyTeacherId(kurumKodu));
   const [copied, setCopied] = useState(false);
   const [printHtml, setPrintHtml] = useState<string | null>(null);
 
   useEffect(() => {
-    try { setTeacherId(localStorage.getItem(storageKey) || ''); } catch { setTeacherId(''); }
-  }, [storageKey]);
+    setTeacherId(readMyTeacherId(kurumKodu));
+  }, [kurumKodu]);
 
   const chooseTeacher = (id: string) => {
     setTeacherId(id);
-    try {
-      if (id) localStorage.setItem(storageKey, id);
-      else localStorage.removeItem(storageKey);
-    } catch { /* depolama kapalı olabilir */ }
+    writeMyTeacherId(kurumKodu, id);
   };
 
   const sortedTeachers = useMemo(

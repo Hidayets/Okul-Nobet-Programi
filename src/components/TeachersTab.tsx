@@ -112,8 +112,10 @@ function DutyDayPicker({
       </div>
       {!compact && (
         <p className="text-[11px] text-slate-400">
-          Sabit gün seçilen öğretmen o gün nöbete öncelikli yazılır; alternatif günlerde yalnız gerektiğinde
-          (ör. sabit günü tatile denk geldiğinde) görevlendirilir. Yalnız alternatif gün seçilirse öğretmen sadece o günlerde tutar.
+          Sabit gün, öğretmenin her haftaki asıl nöbet günüdür; o günün dışında başka güne yazılmaz.
+          Alternatif gün, aynı haftada ikinci nöbet içindir (örneğin sabit gün ve alternatif gün).
+          Sabit gün tatile denk gelirse alternatif gün o haftanın nöbeti olabilir.
+          Yalnız alternatif gün seçilirse öğretmen sadece o günlerde tutar.
           Gün seçimi ile "tutamaz" kısıtı birbirini dışlar.
         </p>
       )}

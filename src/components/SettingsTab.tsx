@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Save, Plus, Trash2, Building2, CheckCircle2, Clock, CalendarDays, Palette, Check, KeyRound, ShieldCheck, Users, Eye, EyeOff, GraduationCap, Mail, CalendarX2, ScanSearch } from 'lucide-react';
+import { Save, Plus, Trash2, Building2, CheckCircle2, Clock, CalendarDays, Palette, Check, KeyRound, ShieldCheck, Users, Eye, EyeOff, GraduationCap, Mail, CalendarX2, ScanSearch, Monitor } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { format, parseISO } from 'date-fns';
 import { tr } from 'date-fns/locale';
@@ -20,6 +20,8 @@ import ChangeHistorySection from './ChangeHistorySection';
 import { getAuthHeaders } from '../lib/apiHeaders';
 import { getTimeDiffInMinutes, normalizeClock, shiftLessonTimes } from '../lib/lessonTimes';
 import { dutyClockRange, formatDutyClock } from '../lib/dutyHours';
+import { shareAccessText } from '../lib/lanAddresses';
+import { useShareAddress } from '../hooks/useShareAddress';
 
 interface Props {
   schoolInfo: SchoolInfo;
@@ -74,6 +76,7 @@ const DAYS_OF_WEEK = [
 
 export default function SettingsTab({ schoolInfo, setSchoolInfo, teachers, locations, holidays, setHolidays, assignments = [], setAssignments, activeYear, isAdmin = false }: Props) {
   const { theme, setTheme } = useTheme();
+  const shareAddresses = useShareAddress(true);
   const [info, setInfo] = useState<SchoolInfo>(schoolInfo);
   // Form düzenlenmediyse dışarıdan gelen güncel okul bilgisini forma yansıt.
   const syncedInfoRef = useRef(schoolInfo);
@@ -444,6 +447,36 @@ export default function SettingsTab({ schoolInfo, setSchoolInfo, teachers, locat
           <span className="font-medium">Tüm ayarlar başarıyla kaydedildi</span>
         </div>
       )}
+
+      <div className="bg-surface p-8 rounded-2xl shadow-sm border border-slate-200">
+        <div className="flex items-center gap-3 mb-4 pb-4 border-b border-slate-100">
+          <div className="bg-sky-100 p-2 rounded-lg text-sky-600">
+            <Monitor className="w-6 h-6" />
+          </div>
+          <div>
+            <h2 className="text-xl font-semibold text-slate-800">Diğer Bilgisayarlar</h2>
+            <p className="text-sm text-slate-500 mt-0.5">Aynı kurum kodu ve şifreyle verilere ulaşma</p>
+          </div>
+        </div>
+        <p className="text-sm text-slate-600 leading-relaxed">{shareAccessText(shareAddresses)}</p>
+        {shareAddresses.length > 0 && (
+          <p className="mt-3 font-mono text-sm text-slate-800">{shareAddresses.join('  ·  ')}</p>
+        )}
+        {typeof window !== 'undefined' && (window as Window & { electronAPI?: { reconfigureConnection?: () => Promise<unknown> } }).electronAPI?.reconfigureConnection && (
+          <button
+            type="button"
+            className="mt-4 px-4 py-2 rounded-lg bg-sky-600 text-white text-sm font-medium hover:bg-sky-700"
+            onClick={() => {
+              const api = (window as Window & { electronAPI?: { reconfigureConnection?: () => Promise<unknown> } }).electronAPI;
+              if (!api?.reconfigureConnection) return;
+              if (!window.confirm('Bağlantı seçimi yeniden açılsın mı? Okul verileri silinmez. Bu bilgisayar verilerin durduğu yerse Ana Bilgisayar seçili kalmalıdır.')) return;
+              void api.reconfigureConnection();
+            }}
+          >
+            Bağlantı türünü değiştir
+          </button>
+        )}
+      </div>
 
       {/* Tema */}
       <div className="bg-surface p-8 rounded-2xl shadow-sm border border-slate-200">

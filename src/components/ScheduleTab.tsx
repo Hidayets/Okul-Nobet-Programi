@@ -22,6 +22,7 @@ import { buildScheduleRows } from '../lib/holidaySchedule';
 import { getScheduleColumnHeader, getWeekHeaderStyle } from '../lib/headerColors';
 import SchedulePreviewDemo from './SchedulePreviewDemo';
 import { weekKey } from '../lib/weeklyQuota';
+import { swapAssignmentTeachers } from '../lib/scheduleSwap';
 
 type ZebraColor = 'none' | 'blue' | 'green' | 'purple' | 'amber';
 
@@ -63,7 +64,7 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
   const [showNotificationModal, setShowNotificationModal] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<'idle' | 'sending' | 'success'>('idle');
   const printMode = null as 'schedule' | 'dutyCounts' | null;
-  const [printPreview, setPrintPreview] = useState<{ title: string; html: string; page: 'portrait' | 'landscape' } | null>(null);
+  const [printPreview, setPrintPreview] = useState<{ title: string; html: string; page: 'portrait' | 'landscape'; note?: string } | null>(null);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [zebraColor, setZebraColor] = useState<ZebraColor>(() => {
     const saved = (typeof localStorage !== 'undefined' && localStorage.getItem(ZEBRA_STORAGE_KEY)) as ZebraColor | null;
@@ -73,6 +74,13 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
   const [showDistributionDetail, setShowDistributionDetail] = useState<'location' | 'month' | null>(null);
   const [popover, setPopover] = useState<{ assignmentId: string; teacherId: string; date: string; locationId: string } | null>(null);
   const [pendingReplace, setPendingReplace] = useState<{ assignmentId: string; teacherId: string; teacherName: string; warnings: string[] } | null>(null);
+  const [fillSlot, setFillSlot] = useState<{ date: string; locationId: string } | null>(null);
+  const [pendingFill, setPendingFill] = useState<{ date: string; locationId: string; teacherId: string; teacherName: string; warnings: string[] } | null>(null);
+  const [pendingSwap, setPendingSwap] = useState<{ sourceId: string; targetId: string } | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const dragAssignmentId = useRef<string | null>(null);
+  const suppressClickId = useRef<string | null>(null);
   const [editReason, setEditReason] = useState<DutyChangeReason | ''>('');
   const [selectedDate, setSelectedDate] = useState<string | null>(() => format(new Date(), 'yyyy-MM-dd'));
   // Bugünün tarihi; gece yarısını otomatik yakalamak için periyodik tazelenir.
@@ -116,8 +124,8 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
     setAssignments(prev => prev.map(a => a.id === assignmentId ? { ...a, isDoubleDuty: !a.isDoubleDuty } : a));
   };
 
-  const recordChange = (assignment: Assignment, toTeacherId?: string) => {
-    if (!setDutyChanges || !editReason) return;
+  const recordChange = (assignment: Assignment, toTeacherId?: string, reason: DutyChangeReason | '' = editReason) => {
+    if (!setDutyChanges || !reason) return;
     const row: DutyChange = {
       id: crypto.randomUUID(),
       at: new Date().toISOString(),
@@ -127,9 +135,25 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
       locationId: assignment.locationId,
       fromTeacherId: assignment.teacherId,
       toTeacherId,
-      reason: editReason,
+      reason,
     };
     setDutyChanges(prev => [...prev, row].slice(-200));
+  };
+
+  const confirmDragSwap = (reason: DutyChangeReason) => {
+    if (!setAssignments || !pendingSwap) return;
+    const source = assignments.find(a => a.id === pendingSwap.sourceId);
+    const target = assignments.find(a => a.id === pendingSwap.targetId);
+    if (!source || !target) {
+      setPendingSwap(null);
+      return;
+    }
+    recordChange(source, target.teacherId, reason);
+    recordChange(target, source.teacherId, reason);
+    setAssignments(prev => swapAssignmentTeachers(prev, source.id, target.id));
+    setPendingSwap(null);
+    setPopover(null);
+    setEditReason('');
   };
 
   const removeAssignment = (assignmentId: string) => {
@@ -153,6 +177,62 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
     setPopover(null);
     setPendingReplace(null);
     setEditReason('');
+  };
+
+  const openFillSlot = (date: string, locationId: string) => {
+    if (!isAdmin || !setAssignments) return;
+    setPopover(null);
+    setEditReason('');
+    setFillSlot({ date, locationId });
+  };
+
+  const commitFill = (date: string, locationId: string, teacherId: string, reason: DutyChangeReason) => {
+    if (!setAssignments) return;
+    const id = crypto.randomUUID();
+    const created: Assignment = { id, date, locationId, teacherId };
+    if (setDutyChanges) {
+      const row: DutyChange = {
+        id: crypto.randomUUID(),
+        at: new Date().toISOString(),
+        by: editorLabel,
+        assignmentId: id,
+        date,
+        locationId,
+        fromTeacherId: '',
+        toTeacherId: teacherId,
+        reason,
+      };
+      setDutyChanges(prev => [...prev, row].slice(-200));
+    }
+    setAssignments(prev => [...prev, created]);
+    setFillSlot(null);
+    setPendingFill(null);
+    setEditReason('');
+  };
+
+  const requestFill = (teacherId: string) => {
+    if (!fillSlot || !editReason) return;
+    const teacher = teachers.find(t => t.id === teacherId);
+    if (!teacher) return;
+    const warnings = dutyChangeWarnings({
+      teacher,
+      date: fillSlot.date,
+      assignments,
+      locations,
+      absences,
+    });
+    if (warnings.length === 0) {
+      commitFill(fillSlot.date, fillSlot.locationId, teacherId, editReason);
+      return;
+    }
+    setPendingFill({
+      date: fillSlot.date,
+      locationId: fillSlot.locationId,
+      teacherId,
+      teacherName: teacher.name,
+      warnings,
+    });
+    setFillSlot(null);
   };
 
   const requestReplace = (assignmentId: string, newTeacherId: string) => {
@@ -309,9 +389,12 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
       a.teacherId === teacher.id && a.date === popover.date && a.id !== popover.assignmentId,
     );
     const dayConflict = !canTeacherDutyOnDay(teacher, dayOfWeek);
-    const candidateTeachers = teachers
-      .filter(t => t.id !== teacher.id && t.dutyType !== 'nobetDisi' && canTeacherDutyOnDay(t, dayOfWeek))
-      .sort((a, b) => a.name.localeCompare(b.name, 'tr'));
+    const byName = (a: Teacher, b: Teacher) => a.name.localeCompare(b.name, 'tr');
+    const replacementPool = teachers.filter(t => t.id !== teacher.id && t.dutyType !== 'nobetDisi');
+    const candidateTeachers = {
+      sameDay: replacementPool.filter(t => canTeacherDutyOnDay(t, dayOfWeek)).sort(byName),
+      otherDays: replacementPool.filter(t => !canTeacherDutyOnDay(t, dayOfWeek)).sort(byName),
+    };
     const currentAssignment = assignments.find(a => a.id === popover.assignmentId);
     return {
       teacher,
@@ -326,6 +409,58 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
       dayOfWeek,
     };
   }, [popover, teachers, assignments]);
+
+  const fillCandidates = useMemo(() => {
+    if (!fillSlot) return { sameDay: [] as Teacher[], otherDays: [] as Teacher[] };
+    const dayOfWeek = getDay(parseISO(fillSlot.date));
+    const byName = (a: Teacher, b: Teacher) => a.name.localeCompare(b.name, 'tr');
+    const pool = teachers.filter(t => t.dutyType !== 'nobetDisi');
+    return {
+      sameDay: pool.filter(t => canTeacherDutyOnDay(t, dayOfWeek)).sort(byName),
+      otherDays: pool.filter(t => !canTeacherDutyOnDay(t, dayOfWeek)).sort(byName),
+    };
+  }, [fillSlot, teachers]);
+
+  const zebraPrint = ZEBRA_COLORS.find(z => z.id === zebraColor)?.print || 'transparent';
+
+  const pendingSwapInfo = useMemo(() => {
+    if (!pendingSwap) return null;
+    const source = assignments.find(a => a.id === pendingSwap.sourceId);
+    const target = assignments.find(a => a.id === pendingSwap.targetId);
+    if (!source || !target) return null;
+    const sourceTeacher = teachers.find(t => t.id === source.teacherId);
+    const targetTeacher = teachers.find(t => t.id === target.teacherId);
+    if (!sourceTeacher || !targetTeacher) return null;
+    const place = (id: string) => locations.find(l => l.id === id)?.name || 'Nöbet yeri';
+    const when = (date: string) => format(parseISO(date), 'd MMMM EEEE', { locale: tr });
+    const warnings = [
+      ...dutyChangeWarnings({
+        teacher: sourceTeacher,
+        date: target.date,
+        assignments,
+        locations,
+        absences,
+        excludeAssignmentId: target.id,
+      }).map(w => `${sourceTeacher.name}: ${w}`),
+      ...dutyChangeWarnings({
+        teacher: targetTeacher,
+        date: source.date,
+        assignments,
+        locations,
+        absences,
+        excludeAssignmentId: source.id,
+      }).map(w => `${targetTeacher.name}: ${w}`),
+    ];
+    return {
+      sourceTeacher,
+      targetTeacher,
+      warnings,
+      sourceWhen: when(source.date),
+      targetWhen: when(target.date),
+      sourcePlace: place(source.locationId),
+      targetPlace: place(target.locationId),
+    };
+  }, [pendingSwap, assignments, teachers, locations, absences]);
 
   const uniqueTeachersInSchedule = useMemo(() => {
     const teacherIds = new Set(assignments.map(a => a.teacherId));
@@ -412,13 +547,13 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
     [assignments, teacherNameMap],
   );
 
-  const openPrintPreview = (selector: string, title: string, page: 'portrait' | 'landscape') => {
+  const openPrintPreview = (selector: string, title: string, page: 'portrait' | 'landscape', note?: string) => {
     const html = capturePrintHtml(selector);
     if (!html) {
       alert('Yazdırılacak içerik bulunamadı.');
       return;
     }
-    setPrintPreview({ title, html, page });
+    setPrintPreview({ title, html, page, note });
   };
 
   const handleExportScheduleToExcel = async () => {
@@ -471,7 +606,6 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
     // Dosya adı oluştur
     const fileName = `Nobet_Sayilari_${yearLabel || 'Egitim_Ogretim'}.xlsx`;
     
-    // Dosyayı indir
     XLSX.writeFile(workbook, fileName);
   };
 
@@ -636,6 +770,7 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
           title={printPreview.title}
           html={printPreview.html}
           page={printPreview.page}
+          note={printPreview.note}
           onClose={() => setPrintPreview(null)}
         />
       )}
@@ -674,11 +809,19 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
             line-height: 1.1 !important;
           }
           .schedule-print-section th { font-weight: bold !important; }
-          .print-week-sep td { padding: 0.5px 2px !important; font-size: 6pt !important; }
+          .print-week-sep td, .schedule-week-row td {
+            padding: 4px 2px !important;
+            font-size: 11pt !important;
+            font-weight: 800 !important;
+            text-align: center !important;
+            letter-spacing: 0.06em !important;
+            border-top: 2px solid #000 !important;
+            border-bottom: 2px solid #000 !important;
+            background: #fff !important;
+            color: #000 !important;
+          }
           .print-zebra-row td {
-            background-color: ${ZEBRA_COLORS.find(z => z.id === zebraColor)?.print || 'transparent'} !important;
-            -webkit-print-color-adjust: exact !important;
-            print-color-adjust: exact !important;
+            background-color: var(--print-zebra, transparent) !important;
           }
           .duty-counts-print-section th,
           .duty-counts-print-section td {
@@ -851,7 +994,7 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
             <button
               onClick={() => { setColorPickerOpen(o => !o); setPopover(null); }}
               className="bg-surface border border-slate-300 hover:bg-slate-50 text-slate-700 px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors shadow-sm"
-              title="Yazdırma satır rengi"
+              title="Çizelgede bir satır ara ile seçilen rengi gösterir"
             >
               <Palette className="w-4 h-4" />
               <span className="hidden md:inline">Satır Rengi</span>
@@ -890,13 +1033,13 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
               <Send className="w-4 h-4" /> Bildirim
             </button>
           )}
-          <button onClick={() => openPrintPreview('.schedule-print-section', 'Nöbet çizelgesi', 'landscape')} className="app-btn app-btn-blue" title="Çizelgeyi yazdırmadan önce önizle">
+          <button onClick={() => openPrintPreview('.schedule-print-section', 'Nöbet çizelgesi', 'landscape')} className="app-btn app-btn-blue" title="Bağlı yazıcının yazdırma ekranını açar">
             <Printer className="w-4 h-4" /> Yazdır
           </button>
-          <button onClick={handleExportScheduleToExcel} className="app-btn app-btn-blue" title="Çizelgeyi her haftası ayrı sayfa olacak şekilde Excel (.xlsx) olarak indir">
+          <button onClick={handleExportScheduleToExcel} className="app-btn app-btn-blue" title="Çizelgeyi Excel olarak indirir">
             <FileSpreadsheet className="w-4 h-4" /> Yazdır (Excel)
           </button>
-          <button onClick={handlePrintDutyCounts} className="app-btn app-btn-green-outline">
+          <button onClick={handlePrintDutyCounts} className="app-btn app-btn-green-outline" title="Nöbet sayılarını Excel olarak indirir">
             <FileSpreadsheet className="w-4 h-4" /> Sayılar Excel
           </button>
           </div>
@@ -905,7 +1048,10 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
 
       <div className="grid grid-cols-1 xl:grid-cols-[1fr_280px] gap-4 print:block">
       {/* Schedule Table - printable for 'schedule' mode */}
-      <div className="schedule-print-section print-color-exact app-card overflow-hidden print:shadow-none print:border-none print:overflow-visible">
+      <div
+        className="schedule-print-section print-color-exact app-card overflow-hidden print:shadow-none print:border-none print:overflow-visible"
+        style={{ ['--print-zebra' as string]: zebraPrint }}
+      >
         
         {/* Print Header */}
         <div className="hidden print:block text-center font-bold print-header-block">
@@ -920,6 +1066,11 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
           {schedulePrintTitle}
         </div>
 
+        {isAdmin && setAssignments && (
+          <p className="px-6 pt-3 text-xs text-slate-500 print:hidden">
+            Öğretmeni başka bir nöbetin üzerine sürükleyin. Gerekçe seçilince iki nöbet yer değiştirir.
+          </p>
+        )}
         <div className="overflow-x-auto print:overflow-visible">
           <table className="w-full text-left border-collapse print:text-[8pt]">
             <thead>
@@ -978,7 +1129,7 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                   return (
                     <React.Fragment key={date}>
                       {isNewWeek && (
-                        <tr className="print-week-sep">
+                        <tr className="print-week-sep schedule-week-row">
                           <td
                             colSpan={colCount}
                             className={`py-2 px-6 print:py-0 print:px-1 text-xs font-bold tracking-wide bg-gradient-to-r ${getWeekHeaderStyle(weekNum)} animate-week-header transition-all duration-500 ${
@@ -1008,10 +1159,10 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                 return (
                   <React.Fragment key={date}>
                     {isNewWeek && (
-                      <tr className="print-week-sep">
+                      <tr className="print-week-sep schedule-week-row">
                         <td
                           colSpan={colCount}
-                          className={`py-2 px-6 print:py-0 print:px-1 text-xs font-bold tracking-wide bg-gradient-to-r ${getWeekHeaderStyle(weekNum)} animate-week-header transition-all duration-500 ${
+                          className={`py-2 px-6 print:py-1 print:px-1 text-xs font-bold tracking-wide bg-gradient-to-r ${getWeekHeaderStyle(weekNum)} animate-week-header transition-all duration-500 ${
                             index > 0 ? 'border-t-[3px] border-slate-300 print:border-t-[2px]' : ''
                           }`}
                         >
@@ -1023,14 +1174,30 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                       onClick={() => setSelectedDate(date)}
                       className={`hover:bg-blue-50/40 transition-colors border-b border-slate-200 cursor-pointer ${index % 2 === 1 ? 'print-zebra-row' : ''} ${selectedDate === date ? 'bg-blue-50/60 ring-1 ring-inset ring-blue-200' : ''}`}
                     >
-                      <td className="py-4 px-6 print:py-0.5 print:px-1 whitespace-nowrap sticky left-0 bg-surface z-10 border-r border-slate-200">
+                      <td
+                        className={`py-4 px-6 print:py-0.5 print:px-1 whitespace-nowrap sticky left-0 z-10 border-r border-slate-200 ${index % 2 === 1 && zebraColor !== 'none' && selectedDate !== date ? '' : 'bg-surface'}`}
+                        style={{ backgroundColor: index % 2 === 1 && zebraColor !== 'none' && selectedDate !== date ? zebraPrint : undefined }}
+                      >
                         <div className="font-medium text-slate-900 print:leading-tight">{formattedDate}</div>
                         <div className="text-sm text-slate-500 print:text-[7pt] print:leading-tight">{dayName}</div>
                       </td>
                       {locations.map((location) => {
                         const cellEntries = scheduleData.data[date]?.[location.id] || [];
                         return (
-                          <td key={location.id} className="py-4 px-6 print:py-0.5 print:px-1 align-top">
+                          <td
+                            key={location.id}
+                            className="py-4 px-6 print:py-0.5 print:px-1 align-top"
+                            style={{ backgroundColor: index % 2 === 1 && zebraColor !== 'none' && selectedDate !== date ? zebraPrint : undefined }}
+                            onDoubleClick={(e) => {
+                              if ((e.target as HTMLElement).closest('[data-duty-chip]')) return;
+                              openFillSlot(date, location.id);
+                            }}
+                            onContextMenu={(e) => {
+                              if ((e.target as HTMLElement).closest('[data-duty-chip]')) return;
+                              e.preventDefault();
+                              openFillSlot(date, location.id);
+                            }}
+                          >
                             {cellEntries.length > 0 ? (
                               <div className="flex flex-col gap-1 print:gap-0">
                                 {cellEntries.map(({ teacher, assignment }) => {
@@ -1040,9 +1207,53 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                                     <button
                                       key={assignment.id}
                                       type="button"
+                                      data-duty-chip=""
+                                      draggable={canEdit}
+                                      onDragStart={(e) => {
+                                        if (!canEdit) return;
+                                        e.stopPropagation();
+                                        dragAssignmentId.current = assignment.id;
+                                        e.dataTransfer.setData('text/plain', assignment.id);
+                                        e.dataTransfer.effectAllowed = 'move';
+                                        setDraggingId(assignment.id);
+                                      }}
+                                      onDragEnd={() => {
+                                        suppressClickId.current = dragAssignmentId.current;
+                                        dragAssignmentId.current = null;
+                                        setDraggingId(null);
+                                        setDragOverId(null);
+                                      }}
+                                      onDragOver={(e) => {
+                                        const sourceId = dragAssignmentId.current;
+                                        if (!canEdit || !sourceId || sourceId === assignment.id) return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        e.dataTransfer.dropEffect = 'move';
+                                        setDragOverId(assignment.id);
+                                      }}
+                                      onDragLeave={() => {
+                                        setDragOverId(current => (current === assignment.id ? null : current));
+                                      }}
+                                      onDrop={(e) => {
+                                        if (!canEdit) return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        const sourceId = e.dataTransfer.getData('text/plain') || dragAssignmentId.current;
+                                        setDragOverId(null);
+                                        setDraggingId(null);
+                                        if (!sourceId || sourceId === assignment.id) return;
+                                        const source = assignments.find(a => a.id === sourceId);
+                                        if (!source || source.teacherId === assignment.teacherId) return;
+                                        setPopover(null);
+                                        setPendingSwap({ sourceId, targetId: assignment.id });
+                                      }}
                                       onClick={(e) => {
                                         if (!canEdit) return;
                                         e.stopPropagation();
+                                        if (suppressClickId.current === assignment.id) {
+                                          suppressClickId.current = null;
+                                          return;
+                                        }
                                         setPopover({
                                           assignmentId: assignment.id,
                                           teacherId: teacher.id,
@@ -1054,8 +1265,10 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                                         isDouble
                                           ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100 print:bg-amber-50 print:text-amber-900 print:border-amber-300'
                                           : teacherColorMap[teacher.id] || 'teacher-chip-blue'
-                                      } ${canEdit ? 'cursor-pointer' : 'cursor-default'}`}
-                                      title={canEdit ? 'Düzenlemek için tıkla' : ''}
+                                      } ${canEdit ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'} ${
+                                        draggingId === assignment.id ? 'opacity-50' : ''
+                                      } ${dragOverId === assignment.id ? 'ring-2 ring-indigo-500' : ''}`}
+                                      title={canEdit ? 'Sürükleyerek yer değiştirin, tıklayarak düzenleyin' : ''}
                                     >
                                       <span>{teacher.name}</span>
                                       {isDouble && (
@@ -1068,7 +1281,13 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                                 })}
                               </div>
                             ) : (
-                              <span className="text-slate-300 text-sm print:text-slate-400">-</span>
+                              <span
+                                className={`block min-h-[1.75rem] text-sm print:text-slate-400 ${isAdmin && setAssignments ? 'text-slate-400 cursor-pointer' : 'text-slate-300'}`}
+                                title={isAdmin && setAssignments ? 'Çift tıklayın veya sağ tıklayın: öğretmen ata' : undefined}
+                              >
+                                <span className="print:hidden">{isAdmin && setAssignments ? 'Ata' : '-'}</span>
+                                <span className="hidden print:inline">-</span>
+                              </span>
                             )}
                           </td>
                         );
@@ -1105,8 +1324,8 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
         {/* Print Footer */}
         <div className="hidden print:block print-footer-block">
           {hasDoubleDuty && (
-            <div className="mb-2" style={{ border: '1px solid #000', padding: '3px 6px', background: '#fef3c7' }}>
-              <strong>NOT:</strong> Yanında "<strong>2x</strong>" işareti bulunan öğretmenler aynı gün <strong>çift nöbet</strong> tutmaktadır.
+            <div className="mb-2" style={{ border: '1px solid #000', padding: '3px 6px' }}>
+              <strong>NOT:</strong> Yanında "<strong>2x</strong>" işareti bulunan öğretmenler aynı hafta farklı bir günde <strong>ikinci nöbet</strong> tutmaktadır.
             </div>
           )}
           <h4 className="font-bold mb-1 underline">NÖBETÇİ ÖĞRETMEN GÖREV TALİMATNAMESİ</h4>
@@ -1124,9 +1343,9 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
               <table style={{ borderCollapse: 'collapse', width: '100%' }}>
                 <thead>
                   <tr>
-                    <th style={{ border: '1px solid #000', padding: '2px 6px', background: '#f0f0f0', width: '30px', fontSize: '7pt' }}>#</th>
-                    <th style={{ border: '1px solid #000', padding: '2px 6px', background: '#f0f0f0', textAlign: 'left', fontSize: '7pt' }}>Öğretmen Adı Soyadı</th>
-                    <th style={{ border: '1px solid #000', padding: '2px 6px', background: '#f0f0f0', width: '120px', fontSize: '7pt' }}>İmza</th>
+                    <th style={{ border: '1px solid #000', padding: '2px 6px', width: '30px', fontSize: '7pt' }}>#</th>
+                    <th style={{ border: '1px solid #000', padding: '2px 6px', textAlign: 'left', fontSize: '7pt' }}>Öğretmen Adı Soyadı</th>
+                    <th style={{ border: '1px solid #000', padding: '2px 6px', width: '120px', fontSize: '7pt' }}>İmza</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1257,9 +1476,9 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
             <tr>
-              <th style={{ border: '1px solid #000', padding: '4px 8px', background: '#f0f0f0', width: '40px' }}>#</th>
-              <th style={{ border: '1px solid #000', padding: '4px 8px', background: '#f0f0f0', textAlign: 'left' }}>Öğretmen Adı</th>
-              <th style={{ border: '1px solid #000', padding: '4px 8px', background: '#f0f0f0', width: '80px' }}>Nöbet Sayısı</th>
+              <th style={{ border: '1px solid #000', padding: '4px 8px', width: '40px' }}>#</th>
+              <th style={{ border: '1px solid #000', padding: '4px 8px', textAlign: 'left' }}>Öğretmen Adı</th>
+              <th style={{ border: '1px solid #000', padding: '4px 8px', width: '80px' }}>Nöbet Sayısı</th>
             </tr>
           </thead>
           <tbody>
@@ -1490,7 +1709,7 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                 )}
                 {popoverInfo.sameDay.length > 0 && (
                   <div className="flex items-center gap-2 text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1.5 rounded">
-                    <span className="text-xs">⚠️ Aynı gün başka nöbet(ler)i var ({popoverInfo.sameDay.length}). Çift nöbet sayılır.</span>
+                    <span className="text-xs">⚠️ Aynı gün başka bir alanda nöbeti var ({popoverInfo.sameDay.length}). Aynı güne iki alan yazılmamalı.</span>
                   </div>
                 )}
                 {popoverInfo.sameWeek.length >= 2 && (
@@ -1528,7 +1747,7 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                 </select>
               </div>
 
-              {popoverInfo.candidateTeachers.length > 0 && (
+              {(popoverInfo.candidateTeachers.sameDay.length > 0 || popoverInfo.candidateTeachers.otherDays.length > 0) && (
                 <div>
                   <div className="text-xs font-medium text-slate-600 mb-1.5">Bu öğretmeni başkasıyla değiştir:</div>
                   <select
@@ -1540,9 +1759,20 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
                     className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-surface disabled:opacity-50"
                   >
                     <option value="">Bir öğretmen seçin...</option>
-                    {popoverInfo.candidateTeachers.map(t => (
-                      <option key={t.id} value={t.id}>{t.name}</option>
-                    ))}
+                    {popoverInfo.candidateTeachers.sameDay.length > 0 && (
+                      <optgroup label="Bu gün">
+                        {popoverInfo.candidateTeachers.sameDay.map(t => (
+                          <option key={t.id} value={t.id}>{t.name}</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {popoverInfo.candidateTeachers.otherDays.length > 0 && (
+                      <optgroup label="Önceki / sonraki günler ve haftalar">
+                        {popoverInfo.candidateTeachers.otherDays.map(t => (
+                          <option key={t.id} value={t.id}>{t.name}</option>
+                        ))}
+                      </optgroup>
+                    )}
                   </select>
                 </div>
               )}
@@ -1554,6 +1784,158 @@ export default function ScheduleTab({ assignments, setAssignments, teachers, loc
               >
                 <Trash2 className="w-4 h-4" />
                 Bu Nöbeti Sil
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {fillSlot && isAdmin && setAssignments && (
+        <div className="fixed inset-0 z-40 flex items-start justify-center pt-24 px-4 print:hidden" onClick={() => setFillSlot(null)}>
+          <div
+            className="bg-surface rounded-2xl shadow-2xl w-full max-w-md border border-slate-200 overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-3 border-b border-slate-200 bg-slate-50/70 flex items-center justify-between">
+              <div>
+                <div className="text-xs text-slate-500">
+                  {format(parseISO(fillSlot.date), 'dd.MM.yyyy EEEE', { locale: tr })} —{' '}
+                  {locations.find(l => l.id === fillSlot.locationId)?.name || ''}
+                </div>
+                <div className="text-base font-semibold text-slate-800">Öğretmen ata</div>
+              </div>
+              <button type="button" onClick={() => setFillSlot(null)} className="text-slate-400 hover:text-slate-700 p-1.5 rounded hover:bg-slate-100">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="px-5 py-4 space-y-3 text-sm">
+              <div>
+                <div className="text-xs font-medium text-slate-600 mb-1.5">Gerekçe</div>
+                <select
+                  value={editReason}
+                  onChange={(e) => setEditReason(e.target.value as DutyChangeReason | '')}
+                  className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-surface"
+                >
+                  <option value="">Gerekçe seçin</option>
+                  {DUTY_CHANGE_REASONS.map((reason) => (
+                    <option key={reason.id} value={reason.id}>{reason.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <div className="text-xs font-medium text-slate-600 mb-1.5">Öğretmen</div>
+                <select
+                  disabled={!editReason}
+                  defaultValue=""
+                  onChange={(e) => {
+                    if (e.target.value) requestFill(e.target.value);
+                  }}
+                  className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-surface disabled:opacity-50"
+                >
+                  <option value="">Bir öğretmen seçin...</option>
+                  {fillCandidates.sameDay.length > 0 && (
+                    <optgroup label="Bu gün">
+                      {fillCandidates.sameDay.map(t => (
+                        <option key={t.id} value={t.id}>{t.name}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {fillCandidates.otherDays.length > 0 && (
+                    <optgroup label="Diğer günler">
+                      {fillCandidates.otherDays.map(t => (
+                        <option key={t.id} value={t.id}>{t.name}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingFill && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm print:hidden">
+          <div className="bg-surface rounded-2xl shadow-xl w-full max-w-md overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100">
+              <h3 className="text-lg font-semibold text-slate-800">Atamadan önce</h3>
+            </div>
+            <div className="p-6">
+              <p className="text-slate-700 mb-3">
+                <span className="font-semibold">{pendingFill.teacherName}</span> bu güne yazılmadan önce:
+              </p>
+              <ul className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-1 mb-4">
+                {pendingFill.warnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => { setPendingFill(null); setFillSlot({ date: pendingFill.date, locationId: pendingFill.locationId }); }}
+                  className="px-4 py-2 rounded-lg text-sm text-slate-600 hover:bg-slate-100"
+                >
+                  Vazgeç
+                </button>
+                <button
+                  type="button"
+                  onClick={() => editReason && commitFill(pendingFill.date, pendingFill.locationId, pendingFill.teacherId, editReason)}
+                  className="px-4 py-2 rounded-lg text-sm font-medium bg-indigo-600 text-white hover:bg-indigo-700"
+                >
+                  Yine de ata
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingSwap && pendingSwapInfo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm print:hidden">
+          <div className="bg-surface rounded-2xl shadow-xl w-full max-w-md overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-slate-800">Yer değiştir</h3>
+              <button
+                type="button"
+                onClick={() => setPendingSwap(null)}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6">
+              <p className="text-slate-700 mb-4">
+                <span className="font-semibold">{pendingSwapInfo.sourceTeacher.name}</span>
+                {' '}({pendingSwapInfo.sourceWhen}, {pendingSwapInfo.sourcePlace}) ile{' '}
+                <span className="font-semibold">{pendingSwapInfo.targetTeacher.name}</span>
+                {' '}({pendingSwapInfo.targetWhen}, {pendingSwapInfo.targetPlace}) yer değiştirecek.
+              </p>
+              {pendingSwapInfo.warnings.length > 0 && (
+                <ul className="mb-4 space-y-1 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  {pendingSwapInfo.warnings.map(warning => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              )}
+              <div className="text-xs font-medium text-slate-600 mb-2">Değişiklik gerekçesi</div>
+              <div className="grid grid-cols-2 gap-2">
+                {DUTY_CHANGE_REASONS.map(reason => (
+                  <button
+                    key={reason.id}
+                    type="button"
+                    onClick={() => confirmDragSwap(reason.id)}
+                    className="px-3 py-2 rounded-lg text-sm font-medium border border-slate-200 bg-slate-50 text-slate-700 hover:bg-indigo-50 hover:border-indigo-300 hover:text-indigo-800 transition-colors text-left"
+                  >
+                    {reason.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingSwap(null)}
+                className="mt-4 w-full px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg font-medium transition-colors"
+              >
+                Vazgeç
               </button>
             </div>
           </div>

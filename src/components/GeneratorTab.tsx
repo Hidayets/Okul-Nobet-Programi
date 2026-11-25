@@ -2,9 +2,8 @@ import { useState, useMemo, useEffect } from 'react';
 import { format, addDays, isBefore, isSameDay, getDay, parseISO, startOfWeek } from 'date-fns';
 import { v4 as uuidv4 } from 'uuid';
 import { Calendar as CalendarIcon, Settings2, AlertCircle, Repeat, MapPin, Users, BarChart3, RefreshCw, ArrowRightLeft } from 'lucide-react';
-import { Teacher, Location, Assignment, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, Holiday, ScheduleArchive, canTeacherDutyOnDay, sortLocationsByOrder } from '../types';
+import { Teacher, Location, Assignment, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, Holiday, ScheduleArchive, sortLocationsByOrder } from '../types';
 import {
-  canTakeSlotToday,
   cloneFairState,
   createFairDistributionState,
   getMonthKey,
@@ -17,6 +16,8 @@ import {
 import { buildTeacherHomeLocations, teacherMatchesLocationOnDate, rotationAnchorWeek } from '../lib/dutyLocation';
 import { collectDutyHistory, historyCountsForWeek, lastHistoryDate, seedFairStateFromHistory } from '../lib/dutyHistory';
 import { arrangeStaircaseWeek, staircaseTarget, type LastDuty, type StaircaseSlot, type StaircaseTarget } from '../lib/staircase';
+import { countTeacherDutiesInWeek, preferredDayStillAhead, teacherDutyRole, teachersForDutySlot } from '../lib/dutySlotRules';
+import { canPlaceWeekDuty, extraDutyPlaceIds, orderLocationsForDutyFill } from '../lib/extraDutyPlace';
 import {
   describeDailyDuty,
   getWeeklyDutyCount,
@@ -84,6 +85,33 @@ export default function GeneratorTab({
 
   const sortedLocations = useMemo(() => sortLocationsByOrder(locations), [locations]);
 
+  const teacherById = useMemo(() => new Map(teachers.map(t => [t.id, t])), [teachers]);
+
+  // Nöbet Yerleri'ndeki "İlk Hafta" tablosu: yer + gün → öğretmenler.
+  const firstWeekGrid = useMemo(() => {
+    const map: Record<string, Record<number, string[]>> = {};
+    for (const loc of sortedLocations) {
+      for (const duty of loc.duties || []) {
+        const teacher = teacherById.get(duty.teacherId);
+        if (!teacher || teacher.dutyType === 'nobetDisi') continue;
+        (((map[loc.id] ??= {})[duty.day]) ??= []).push(duty.teacherId);
+      }
+    }
+    return map;
+  }, [sortedLocations, teacherById]);
+  const hasFirstWeekTable = useMemo(
+    () => Object.values(firstWeekGrid).some(days => Object.values(days).some(list => list.length > 0)),
+    [firstWeekGrid],
+  );
+
+  // Tablonun uygulanacağı hafta: başlangıç tarihinin bulunduğu takvim haftası.
+  const firstWeekStartMs = useMemo(
+    () => startOfWeek(parseISO(startDate), { weekStartsOn: 1 }).getTime(),
+    [startDate],
+  );
+  const isFirstWeekDate = (date: Date) =>
+    startOfWeek(date, { weekStartsOn: 1 }).getTime() === firstWeekStartMs;
+
   useEffect(() => {
     setActiveDays(settings.schoolDays);
   }, [settings.schoolDays.join(',')]);
@@ -104,6 +132,18 @@ export default function GeneratorTab({
     const teacherCount = eligibleTeachers.length;
     return { totalWeekly, teacherCount };
   }, [sortedLocations, eligibleTeachers]);
+
+  const extraPlaces = useMemo(() => extraDutyPlaceIds(sortedLocations), [sortedLocations]);
+  const locationsForFill = useMemo(
+    () => orderLocationsForDutyFill(sortedLocations, extraPlaces),
+    [sortedLocations, extraPlaces],
+  );
+  const allowExtraDuty = weeklyStats.teacherCount > 0 && weeklyStats.teacherCount < weeklyStats.totalWeekly;
+  const dutyContext = (date: Date, weekDutyCount: Record<string, number>) => ({
+    weekDutyCount,
+    allowExtraDuty,
+    fixedDayStillAhead: (teacher: Teacher) => preferredDayStillAhead(teacher, date, activeDays, holidayDates),
+  });
 
   const dailyLabel = (loc: Location) => describeDailyDuty(getWeeklyDutyCount(loc), activeDays.length);
 
@@ -164,21 +204,29 @@ export default function GeneratorTab({
     assignedToday: Set<string>,
     fairState: ReturnType<typeof createFairDistributionState>,
     refWeekStart: Date,
+    weekDutyCount: Record<string, number>,
   ): string | null => {
     const location = sortedLocations.find(l => l.id === locationId);
     const hasAssignedTeachers = location?.assignedTeacherIds && location.assignedTeacherIds.length > 0;
-    // Sabit Atama'da herkes atandığı yerde kalır; Dönerli'de hareketliler haftalık döner.
     const matchesAssigned = (t: Teacher) =>
       rotationMode === 'locationBased'
         ? (teacherHomeLocation[t.id] ?? []).includes(locationId)
         : teacherMatchesLocationOnDate(t, locationId, date, sortedLocations, teacherHomeLocation, refWeekStart);
 
-    // Yeni sistemde genellikle preferredTeacherId boş gelir, doğrudan adil dağıtım yapılır
+    const fitsPlace = (teacherId: string) => canPlaceWeekDuty(weekDutyCount[teacherId] ?? 0, locationId, extraPlaces);
+    const available = teachersForDutySlot(
+      eligibleTeachers,
+      dayOfWeek,
+      assignedToday,
+      dutyContext(date, weekDutyCount),
+    ).filter((t: Teacher) => (!preferredTeacherId || t.id !== preferredTeacherId) && fitsPlace(t.id));
+
     if (preferredTeacherId) {
       const preferred = teachers.find(t => t.id === preferredTeacherId);
       if (
         preferred &&
-        canTeacherDutyOnDay(preferred, dayOfWeek) &&
+        fitsPlace(preferred.id) &&
+        available.concat(teachersForDutySlot([preferred], dayOfWeek, assignedToday, dutyContext(date, weekDutyCount))).some(t => t.id === preferred.id) &&
         !assignedToday.has(preferredTeacherId) &&
         matchesAssigned(preferred)
       ) {
@@ -186,36 +234,22 @@ export default function GeneratorTab({
       }
     }
 
-    // Eğer bu nöbet yerine atanmış öğretmen yoksa, tüm eligible öğretmenleri adil dağıt
-    if (!hasAssignedTeachers) {
-      const available = eligibleTeachers.filter((t: Teacher) =>
-        canTeacherDutyOnDay(t, dayOfWeek) &&
-        !assignedToday.has(t.id)
-      );
-      // Dönüş sırası bu yere gelen hareketliler önce; başka yere atanmışlar kendi yerlerinde
-      // boş kalmasın diye en sona bırakılır.
-      const rotatedHere = available.filter((t: Teacher) => hasHome(t.id) && matchesAssigned(t));
-      const unanchored = available.filter((t: Teacher) => !hasHome(t.id));
-      const pool = rotatedHere.length > 0 ? rotatedHere : unanchored.length > 0 ? unanchored : available;
-      const chosen = pickTeacherForSlot(pool, fairState, assignedToday, locationId, monthKey, dayOfWeek, format(date, 'yyyy-MM-dd'));
-      return chosen?.id ?? null;
-    }
-
-    // Atanmış öğretmenler varsa, onları öncelikli olarak kullan
-    const substitutes = eligibleTeachers.filter((t: Teacher) => {
-      if (preferredTeacherId && t.id === preferredTeacherId) return false;
-      if (!canTeacherDutyOnDay(t, dayOfWeek)) return false;
-      if (!canTakeSlotToday(t.id, locationId, assignedToday, homeCount(t.id))) return false;
-      if (!hasHome(t.id)) return true;
-      return matchesAssigned(t);
-    });
-
-    // Pool oluştur: önce o gün boşta olan yerleşik öğretmenler, sonra diğerleri, en son çift nöbet
-    const preferred = preferSlotPool(substitutes, assignedToday, hasHome);
-    const pool = preferred.length > 0
-      ? preferred
-      : eligibleTeachers.filter((t: Teacher) => canTeacherDutyOnDay(t, dayOfWeek) && !assignedToday.has(t.id));
-
+    const located = hasAssignedTeachers
+      ? available.filter((t: Teacher) => !hasHome(t.id) || matchesAssigned(t))
+      : available.filter((t: Teacher) => {
+          if (hasHome(t.id) && matchesAssigned(t)) return true;
+          if (!hasHome(t.id)) return true;
+          return false;
+        });
+    const homeFirst = !hasAssignedTeachers
+      ? located.filter((t: Teacher) => hasHome(t.id) && matchesAssigned(t))
+      : [];
+    const unanchored = !hasAssignedTeachers ? located.filter((t: Teacher) => !hasHome(t.id)) : [];
+    const narrowed = !hasAssignedTeachers
+      ? (homeFirst.length > 0 ? homeFirst : unanchored.length > 0 ? unanchored : located)
+      : located;
+    const preferredPool = preferSlotPool(narrowed, assignedToday, hasHome);
+    const pool = preferredPool.length > 0 ? preferredPool : narrowed.length > 0 ? narrowed : available;
     const chosen = pickTeacherForSlot(pool, fairState, assignedToday, locationId, monthKey, dayOfWeek, format(date, 'yyyy-MM-dd'));
     return chosen?.id ?? null;
   };
@@ -257,6 +291,7 @@ export default function GeneratorTab({
     const activeDayCount = activeDays.length;
 
     const weeklyAssignmentCounts: Record<string, number> = {};
+    let weekTeacherCounts: Record<string, number> = {};
     let currentWeek = '';
 
     while (isBefore(currentDate, end) || isSameDay(currentDate, end)) {
@@ -271,14 +306,39 @@ export default function GeneratorTab({
       if (wk !== currentWeek) {
         currentWeek = wk;
         resetWeeklyCounts(weeklyAssignmentCounts, wk);
+        weekTeacherCounts = countTeacherDutiesInWeek(history, wk);
       }
 
       const monthKey = getMonthKey(dateStr);
-      // Bir öğretmen aynı günde 1 nöbet tutar; çift nöbetliler gerekirse ikinci yerinde de tutar.
+      // Aynı gün tek alan. İkinci nöbet aynı haftanın başka gününe yazılır.
       const assignedToday = new Set<string>();
       const remainingDays = remainingActiveDaysInWeek(currentDate, activeDays, holidayDates);
 
-      for (const location of sortedLocations) {
+      // İlk hafta: Nöbet Yerleri'ndeki tablo birebir uygulanır.
+      if (hasFirstWeekTable && isFirstWeekDate(currentDate)) {
+        for (const location of locationsForFill) {
+          const planned = firstWeekGrid[location.id]?.[dayOfWeek] ?? [];
+          for (const teacherId of planned) {
+            if (assignedToday.has(teacherId)) continue;
+            const extraDuty = (weekTeacherCounts[teacherId] ?? 0) > 0;
+            newAssignments.push({
+              id: uuidv4(),
+              date: dateStr,
+              locationId: location.id,
+              teacherId,
+              ...(extraDuty ? { isDoubleDuty: true } : {}),
+            });
+            weekTeacherCounts[teacherId] = (weekTeacherCounts[teacherId] ?? 0) + 1;
+            markAssignedToday(assignedToday, teacherId, location.id);
+            recordSlotAssignment(fairState, teacherId, location.id, dateStr);
+            weeklyAssignmentCounts[location.id] = (weeklyAssignmentCounts[location.id] ?? 0) + 1;
+          }
+        }
+        currentDate = addDays(currentDate, 1);
+        continue;
+      }
+
+      for (const location of locationsForFill) {
         const slots = slotsForDay(
           getWeeklyDutyCount(location),
           weeklyAssignmentCounts[location.id],
@@ -295,16 +355,19 @@ export default function GeneratorTab({
             assignedToday,
             fairState,
             refWeekStart,
+            weekTeacherCounts,
           );
           if (!teacherId) break;
 
+          const extraDuty = (weekTeacherCounts[teacherId] ?? 0) > 0;
           newAssignments.push({
             id: uuidv4(),
             date: dateStr,
             locationId: location.id,
             teacherId,
-            ...(assignedToday.has(teacherId) ? { isDoubleDuty: true } : {}),
+            ...(extraDuty ? { isDoubleDuty: true } : {}),
           });
+          weekTeacherCounts[teacherId] = (weekTeacherCounts[teacherId] ?? 0) + 1;
           markAssignedToday(assignedToday, teacherId, location.id);
           recordSlotAssignment(fairState, teacherId, location.id, dateStr);
           weeklyAssignmentCounts[location.id]++;
@@ -341,6 +404,7 @@ export default function GeneratorTab({
     const activeDayCount = activeDays.length;
 
     const weeklyAssignmentCounts: Record<string, number> = {};
+    let weekTeacherCounts: Record<string, number> = {};
     let currentWeek = '';
 
     while (isBefore(currentDate, end) || isSameDay(currentDate, end)) {
@@ -355,14 +419,39 @@ export default function GeneratorTab({
       if (wk !== currentWeek) {
         currentWeek = wk;
         resetWeeklyCounts(weeklyAssignmentCounts, wk);
+        weekTeacherCounts = countTeacherDutiesInWeek(history, wk);
       }
 
       const monthKey = getMonthKey(dateStr);
       const assignedToday = new Set<string>();
       const remainingDays = remainingActiveDaysInWeek(currentDate, activeDays, holidayDates);
 
+      // İlk hafta: Nöbet Yerleri'ndeki tablo birebir uygulanır; kalan öğretmenler sonraki haftalarda eklenir.
+      if (hasFirstWeekTable && isFirstWeekDate(currentDate)) {
+        for (const location of locationsForFill) {
+          const planned = firstWeekGrid[location.id]?.[dayOfWeek] ?? [];
+          for (const teacherId of planned) {
+            if (assignedToday.has(teacherId)) continue;
+            const extraDuty = (weekTeacherCounts[teacherId] ?? 0) > 0;
+            newAssignments.push({
+              id: uuidv4(),
+              date: dateStr,
+              locationId: location.id,
+              teacherId,
+              ...(extraDuty ? { isDoubleDuty: true } : {}),
+            });
+            weekTeacherCounts[teacherId] = (weekTeacherCounts[teacherId] ?? 0) + 1;
+            recordSlotAssignment(fairState, teacherId, location.id, dateStr);
+            markAssignedToday(assignedToday, teacherId, location.id);
+            weeklyAssignmentCounts[location.id] = (weeklyAssignmentCounts[location.id] ?? 0) + 1;
+          }
+        }
+        currentDate = addDays(currentDate, 1);
+        continue;
+      }
+
       const slotsToFill: string[] = [];
-      for (const location of sortedLocations) {
+      for (const location of locationsForFill) {
         const slots = slotsForDay(
           getWeeklyDutyCount(location),
           weeklyAssignmentCounts[location.id],
@@ -372,22 +461,23 @@ export default function GeneratorTab({
         for (let k = 0; k < slots; k++) slotsToFill.push(location.id);
       }
 
-      const availableForDay = eligibleTeachers.filter((t: Teacher) => canTeacherDutyOnDay(t, dayOfWeek));
-
-      if (availableForDay.length === 0 || slotsToFill.length === 0) {
+      if (slotsToFill.length === 0) {
         currentDate = addDays(currentDate, 1);
         continue;
       }
 
       for (let s = 0; s < slotsToFill.length; s++) {
+        const availableForDay = teachersForDutySlot(
+          eligibleTeachers,
+          dayOfWeek,
+          assignedToday,
+          dutyContext(currentDate, weekTeacherCounts),
+        ).filter((t: Teacher) => canPlaceWeekDuty(weekTeacherCounts[t.id] ?? 0, slotsToFill[s], extraPlaces));
         const slotCandidates = availableForDay.filter((t: Teacher) =>
-          canTakeSlotToday(t.id, slotsToFill[s], assignedToday, homeCount(t.id))
-          && teacherMatchesSlot(t, slotsToFill[s], currentDate, refWeekStart),
+          teacherMatchesSlot(t, slotsToFill[s], currentDate, refWeekStart),
         );
         const preferredCandidates = preferSlotPool(slotCandidates, assignedToday, hasHome);
-        const pool = preferredCandidates.length > 0
-          ? preferredCandidates
-          : availableForDay.filter((t: Teacher) => !assignedToday.has(t.id));
+        const pool = preferredCandidates.length > 0 ? preferredCandidates : slotCandidates.length > 0 ? slotCandidates : availableForDay;
 
         const chosen = pickTeacherForSlot(
           pool,
@@ -400,25 +490,25 @@ export default function GeneratorTab({
         );
         if (!chosen) continue;
 
-        const isDoubleDuty = assignedToday.has(chosen.id);
-        if (!isDoubleDuty) {
-          const matchesSlot = (locId: string) =>
-            teacherMatchesSlot(chosen, locId, currentDate, refWeekStart);
-          const bestSlotIdx = pickBestSlotIndex(slotsToFill, s, fairState, chosen.id, matchesSlot);
-          if (bestSlotIdx !== s) {
-            [slotsToFill[s], slotsToFill[bestSlotIdx]] = [slotsToFill[bestSlotIdx], slotsToFill[s]];
-          }
+        const matchesSlot = (locId: string) =>
+          teacherMatchesSlot(chosen, locId, currentDate, refWeekStart)
+          && canPlaceWeekDuty(weekTeacherCounts[chosen.id] ?? 0, locId, extraPlaces);
+        const bestSlotIdx = pickBestSlotIndex(slotsToFill, s, fairState, chosen.id, matchesSlot);
+        if (bestSlotIdx !== s) {
+          [slotsToFill[s], slotsToFill[bestSlotIdx]] = [slotsToFill[bestSlotIdx], slotsToFill[s]];
         }
 
         const locationId = slotsToFill[s];
+        const extraDuty = (weekTeacherCounts[chosen.id] ?? 0) > 0;
         newAssignments.push({
           id: uuidv4(),
           date: dateStr,
           locationId,
           teacherId: chosen.id,
-          ...(isDoubleDuty ? { isDoubleDuty: true } : {}),
+          ...(extraDuty ? { isDoubleDuty: true } : {}),
         });
 
+        weekTeacherCounts[chosen.id] = (weekTeacherCounts[chosen.id] ?? 0) + 1;
         recordSlotAssignment(fairState, chosen.id, locationId, dateStr, s);
         markAssignedToday(assignedToday, chosen.id, locationId);
         weeklyAssignmentCounts[locationId]++;
@@ -446,10 +536,6 @@ export default function GeneratorTab({
       setError('Lütfen en az bir nöbet günü seçin.');
       return;
     }
-    if (eligibleTeachers.length < totalDuties) {
-      setError('Nöbet tutacak öğretmen sayısı, toplam nöbetçi sayısından az olamaz.');
-      return;
-    }
 
     let fairState = createSeededState();
     const newAssignments: Assignment[] = [];
@@ -463,6 +549,16 @@ export default function GeneratorTab({
     const lastDuty: Record<string, LastDuty> = {};
     for (const a of history) {
       lastDuty[a.teacherId] = { dayOfWeek: getDay(parseISO(a.date)), locationId: a.locationId };
+    }
+
+    // Tablo varsa ilk hafta tabanı olur; sonraki haftalar bu tablodan merdiven gibi devam eder.
+    if (hasFirstWeekTable) {
+      for (const loc of sortedLocations) {
+        for (const duty of loc.duties || []) {
+          if (!teacherById.has(duty.teacherId)) continue;
+          lastDuty[duty.teacherId] = { dayOfWeek: duty.day, locationId: loc.id };
+        }
+      }
     }
 
     const refWeekStart = rotationRefWeek(start);
@@ -491,11 +587,26 @@ export default function GeneratorTab({
       const firstDateOfWeek = [...dates.values()].sort()[0];
       resetWeeklyCounts(weeklyAssignmentCounts, weekKey(parseISO(firstDateOfWeek)));
 
+      // İlk hafta: Nöbet Yerleri'ndeki tablo birebir uygulanır; kalanlar sonraki haftalarda eklenir.
+      if (hasFirstWeekTable && startOfWeek(parseISO(firstDateOfWeek), { weekStartsOn: 1 }).getTime() === firstWeekStartMs) {
+        for (const [dow, dateStr] of dates) {
+          for (const location of locationsForFill) {
+            const planned = firstWeekGrid[location.id]?.[dow] ?? [];
+            for (const teacherId of planned) {
+              newAssignments.push({ id: uuidv4(), date: dateStr, locationId: location.id, teacherId });
+              recordSlotAssignment(fairState, teacherId, location.id, dateStr);
+              lastDuty[teacherId] = { dayOfWeek: dow, locationId: location.id };
+            }
+          }
+        }
+        continue;
+      }
+
       for (const day of sortedDays) {
         const dateStr = dates.get(day);
         if (!dateStr) continue;
         const remainingDays = remainingActiveDaysInWeek(parseISO(dateStr), activeDays, holidayDates);
-        for (const location of sortedLocations) {
+        for (const location of locationsForFill) {
           const slots = slotsForDay(
             getWeeklyDutyCount(location),
             weeklyAssignmentCounts[location.id],
@@ -509,27 +620,29 @@ export default function GeneratorTab({
         }
       }
 
-      // Bir öğretmen aynı günde 1 nöbet tutar (haftada değil); çift nöbetliler gerekirse ikinci yerinde de tutar.
-      // Önce adalet sırasıyla bu hafta kimin nöbet tutacağı seçilir, sonra kişiler merdiven sırasına dizilir.
+      // Aynı gün tek alan. İkinci nöbet, ihtiyaç varsa aynı haftanın alternatif gününe yazılır.
       const assignedByDate = new Map<string, Set<string>>();
       const monthKey = weekAssignments[0] ? getMonthKey(weekAssignments[0].dateStr) : '';
       const weekStartState = cloneFairState(fairState);
       const picked: StaircaseSlot[] = [];
+      const weekTeacherCounts = countTeacherDutiesInWeek(history, weekKey(parseISO(firstDateOfWeek)));
 
       for (const { dateStr, locationId } of weekAssignments) {
         if (!assignedByDate.has(dateStr)) assignedByDate.set(dateStr, new Set());
         const assignedToday = assignedByDate.get(dateStr)!;
         const dow = getDay(parseISO(dateStr));
         const date = parseISO(dateStr);
-        const availableForDay = eligibleTeachers.filter((t: Teacher) => canTeacherDutyOnDay(t, dow));
+        const availableForDay = teachersForDutySlot(
+          eligibleTeachers,
+          dow,
+          assignedToday,
+          dutyContext(date, weekTeacherCounts),
+        ).filter((t: Teacher) => canPlaceWeekDuty(weekTeacherCounts[t.id] ?? 0, locationId, extraPlaces));
         const slotCandidates = availableForDay.filter((t: Teacher) =>
-          canTakeSlotToday(t.id, locationId, assignedToday, homeCount(t.id))
-          && teacherMatchesSlot(t, locationId, date, refWeekStart),
+          teacherMatchesSlot(t, locationId, date, refWeekStart),
         );
         const preferredCandidates = preferSlotPool(slotCandidates, assignedToday, hasHome);
-        const pool = preferredCandidates.length > 0
-          ? preferredCandidates
-          : availableForDay.filter((t: Teacher) => !assignedToday.has(t.id));
+        const pool = preferredCandidates.length > 0 ? preferredCandidates : slotCandidates.length > 0 ? slotCandidates : availableForDay;
 
         const chosen = pickTeacherForSlot(
           pool,
@@ -543,6 +656,7 @@ export default function GeneratorTab({
         if (!chosen) continue;
 
         picked.push({ dateStr, dayOfWeek: dow, locationId, teacherId: chosen.id });
+        weekTeacherCounts[chosen.id] = (weekTeacherCounts[chosen.id] ?? 0) + 1;
         markAssignedToday(assignedToday, chosen.id, locationId);
         recordSlotAssignment(fairState, chosen.id, locationId, dateStr);
       }
@@ -556,27 +670,39 @@ export default function GeneratorTab({
         preferredDayOf: id => teacherById.get(id)?.preferredDay,
         dayOk: (id, slot) => {
           const t = teacherById.get(id);
-          return !!t && canTeacherDutyOnDay(t, slot.dayOfWeek);
+          if (!t) return false;
+          const role = teacherDutyRole(t, slot.dayOfWeek);
+          if (role === 'primary') return true;
+          if (role !== 'extra') return false;
+          return picked.some(p => p.teacherId === id && p.dateStr !== slot.dateStr);
         },
         homeOk: (id, slot) => {
           const t = teacherById.get(id);
           return !!t && teacherMatchesSlot(t, slot.locationId, parseISO(slot.dateStr), refWeekStart);
         },
+        extraDutyPlaceIds: extraPlaces ? [...extraPlaces] : undefined,
       });
 
       fairState = weekStartState;
-      const seenByDate = new Map<string, Set<string>>();
+      const datesByTeacher = new Map<string, Set<string>>();
       for (const slot of arranged) {
-        if (!seenByDate.has(slot.dateStr)) seenByDate.set(slot.dateStr, new Set());
-        const seen = seenByDate.get(slot.dateStr)!;
+        if (!datesByTeacher.has(slot.teacherId)) datesByTeacher.set(slot.teacherId, new Set());
+        datesByTeacher.get(slot.teacherId)!.add(slot.dateStr);
+      }
+      for (const slot of arranged) {
+        const dates = datesByTeacher.get(slot.teacherId) ?? new Set<string>();
+        const preferredDay = teacherById.get(slot.teacherId)?.preferredDay;
+        const earliest = [...dates].sort()[0];
+        const extraDuty = dates.size > 1 && (
+          typeof preferredDay === 'number' ? slot.dayOfWeek !== preferredDay : slot.dateStr !== earliest
+        );
         newAssignments.push({
           id: uuidv4(),
           date: slot.dateStr,
           locationId: slot.locationId,
           teacherId: slot.teacherId,
-          ...(seen.has(slot.teacherId) ? { isDoubleDuty: true } : {}),
+          ...(extraDuty ? { isDoubleDuty: true } : {}),
         });
-        seen.add(slot.teacherId);
         recordSlotAssignment(fairState, slot.teacherId, slot.locationId, slot.dateStr);
         lastDuty[slot.teacherId] = { dayOfWeek: slot.dayOfWeek, locationId: slot.locationId };
       }
@@ -676,6 +802,56 @@ export default function GeneratorTab({
               >
                 Son nöbetin ertesi gününden başla ({format(addDays(parseISO(lastScheduledDate), 1), 'dd.MM.yyyy')})
               </button>
+            )}
+          </div>
+
+          {/* Nöbet Yerleri'ndeki ilk hafta tablosu — canlı önizleme */}
+          <div className="p-4 rounded-xl border border-emerald-100 bg-emerald-50/40">
+            <div className="flex items-center gap-2 mb-2">
+              <MapPin className="w-4 h-4 text-emerald-600" />
+              <h4 className="text-sm font-semibold text-emerald-800">İlk Hafta Nöbet Tablosu</h4>
+            </div>
+            {!hasFirstWeekTable ? (
+              <p className="text-xs text-slate-500">
+                Nöbet Yerleri sekmesinde öğretmen atayıp tabloyu düzenlediğinizde o tablo burada görünür ve
+                programın ilk haftası olarak kullanılır. Kalan öğretmenler sonraki haftalarda dönüş şekline göre eklenir.
+              </p>
+            ) : (
+              <>
+                <p className="text-xs text-slate-600 mb-3">
+                  Nöbet Yerleri'ndeki değişiklikler burada anlık görünür. Program oluşturulurken ilk hafta bu tablodan
+                  birebir yazılır; sonraki haftalar seçtiğiniz dönüş şekline göre bu tablodan devam eder.
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="text-xs border-collapse w-full">
+                    <thead>
+                      <tr>
+                        <th className="py-1.5 px-2 text-left text-emerald-700 font-semibold border-b border-emerald-200 whitespace-nowrap">Nöbet Yeri</th>
+                        {sortedPreviewDays.map(d => (
+                          <th key={d} className="py-1.5 px-2 text-emerald-700 font-semibold border-b border-emerald-200 whitespace-nowrap">{DAY_SHORT[d]}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedLocations.map(loc => (
+                        <tr key={loc.id}>
+                          <td className="py-1.5 px-2 font-medium text-slate-700 border-b border-emerald-100 whitespace-nowrap">{loc.name}</td>
+                          {sortedPreviewDays.map(d => {
+                            const names = (firstWeekGrid[loc.id]?.[d] ?? [])
+                              .map(id => teacherById.get(id)?.name)
+                              .filter(Boolean) as string[];
+                            return (
+                              <td key={d} className="py-1.5 px-2 text-slate-600 border-b border-emerald-100">
+                                {names.length > 0 ? names.join(', ') : <span className="text-slate-300">—</span>}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
             )}
           </div>
 
@@ -886,8 +1062,8 @@ export default function GeneratorTab({
                 <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg">
                   <Users className="w-4 h-4 text-amber-600 mt-0.5 flex-shrink-0" />
                   <p className="text-xs text-amber-700">
-                    <span className="font-semibold">Öğretmen eksikliği:</span> Her hafta {totalWeekly - teacherCount} ekstra nöbet gerekiyor. 
-                    Sistem çift nöbetleri adilce dağıtır.
+                    <span className="font-semibold">Öğretmen eksikliği:</span> Her hafta {totalWeekly - teacherCount} ek nöbet gerekiyor.
+                    Ek nöbet, alternatif günü belirtilen öğretmene aynı haftanın başka gününde yazılır.
                   </p>
                 </div>
               )}
@@ -928,6 +1104,13 @@ export default function GeneratorTab({
                 ))}
               </div>
             </div>
+          )}
+
+          {extraPlaces && (
+            <p className="text-xs text-slate-600 pt-4">
+              İkinci nöbet yerleri: {sortedLocations.filter(l => l.extraDutyPlace).map(l => l.name).join(', ')}.
+              Aynı haftadaki ikinci ve sonraki nöbetler yalnız bu yerlere yazılır.
+            </p>
           )}
 
           <div className="pt-6 border-t border-slate-100">

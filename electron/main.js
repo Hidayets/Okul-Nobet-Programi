@@ -1,11 +1,13 @@
 import { app, BrowserWindow, shell, ipcMain, dialog } from 'electron';
 import { spawn, execFile } from 'child_process';
+import net from 'net';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import electronUpdater from 'electron-updater';
+import { DEFAULT_SERVER_PORT, MAX_SERVER_PORT, serverUrlCandidates } from './server-address.js';
 const { autoUpdater } = electronUpdater;
 const require = createRequire(import.meta.url);
 
@@ -19,12 +21,14 @@ app.setName('okul-nobet-programi');
 // Kilit userData klasörüne bağlı olduğundan setName'den sonra alınmalı.
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
+  // İkinci kopya: hiçbir şey başlatmadan hemen kapan. Böylece simgeye birden
+  // fazla tıklansa da tek bir uygulama çalışır.
   app.quit();
 } else {
   app.on('second-instance', () => {
-    const win = mainWindow && !mainWindow.isDestroyed()
-      ? mainWindow
-      : BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
+    // Açık bir pencere varsa (ana pencere veya bağlantı ayar penceresi) öne getir.
+    const win = [mainWindow, setupWindow].find(w => w && !w.isDestroyed())
+      || BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
     if (!win) return;
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.show();
@@ -39,13 +43,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
 const isDev   = process.env.NODE_ENV === 'development';
-const PORT    = 3000;
+let PORT       = DEFAULT_SERVER_PORT;
 
 let mainWindow   = null;
+let setupWindow  = null;
 let serverProcess = null;
 let serverStartError = '';
 let serverExited = false;
 let serverLogPath = '';
+let serverLogStartOffset = 0;
 let appMode = null; // 'server' | 'client'
 let serverUrl = `http://127.0.0.1:${PORT}`;
 
@@ -61,15 +67,6 @@ function readCloudUrl() {
   } catch {
     return '';
   }
-}
-
-// "192.168.1.5", "192.168.1.5:3000" ya da "https://okul.ornek.com" kabul edilir.
-function resolveServerUrl(input) {
-  const raw = String(input || '').trim().replace(/\/+$/, '');
-  if (!raw) return `http://localhost:${PORT}`;
-  if (/^https?:\/\//i.test(raw)) return raw;
-  if (raw.includes(':')) return `http://${raw}`;
-  return `http://${raw}:${PORT}`;
 }
 
 autoUpdater.autoDownload = true;
@@ -179,7 +176,8 @@ ipcMain.handle('updater:check', async () => {
   }
 });
 
-ipcMain.handle('updater:install', async () => {
+ipcMain.handle('updater:install', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   try {
     // Kurulumdan hemen önce son bir yedek daha al (savunmacı katman).
     try { backupDatabase('pre-update'); } catch {}
@@ -210,15 +208,18 @@ function isTrustedSender(evt) {
 const UNTRUSTED = { ok: false, error: 'Bu işleme izin verilmiyor.' };
 
 // ───── Yedekleme IPC'leri ─────
-ipcMain.handle('backup:create', async () => {
+ipcMain.handle('backup:create', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   return backupDatabase('manual');
 });
 
-ipcMain.handle('backup:list', async () => {
+ipcMain.handle('backup:list', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   return listBackups();
 });
 
-ipcMain.handle('backup:open-folder', async () => {
+ipcMain.handle('backup:open-folder', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   try {
     ensureBackupDir();
     await shell.openPath(BACKUP_DIR);
@@ -228,7 +229,8 @@ ipcMain.handle('backup:open-folder', async () => {
   }
 });
 
-ipcMain.handle('backup:get-paths', async () => {
+ipcMain.handle('backup:get-paths', async (evt) => {
+  if (!isTrustedSender(evt)) return UNTRUSTED;
   return {
     dbFile: DB_FILE,
     backupDir: BACKUP_DIR,
@@ -460,6 +462,17 @@ ipcMain.handle('backup:pick-and-restore', async (evt) => {
   }
 });
 
+ipcMain.handle('connection:reconfigure', () => {
+  clearConnectionSettings();
+  try {
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+    fs.writeFileSync(ASK_CONNECTION_FILE, '1');
+  } catch {}
+  app.relaunch();
+  app.quit();
+  return { ok: true };
+});
+
 ipcMain.handle('app:get-info', () => {
   return {
     version: app.getVersion(),
@@ -481,6 +494,24 @@ ipcMain.handle('app:get-info', () => {
 // orada bulursak otomatik olarak yeni konuma taşıyoruz (geriye dönük uyumluluk).
 const SETTINGS_DIR  = path.join(os.homedir(), 'AppData', 'Local', 'OkulNobetProgrami');
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'connection-settings.json');
+const ASK_CONNECTION_FILE = path.join(SETTINGS_DIR, 'ask-connection.txt');
+
+// Tanıtım (onboarding) turu yalnızca ilk kurulumda gösterilir. Bayrak, bağlantı
+// ayarlarıyla aynı sabit klasörde tutulur; böylece sunucu adresi (origin)
+// değişse veya localStorage silinse bile bir kez gösterildikten sonra tekrar açılmaz.
+const ONBOARDING_FILE = path.join(SETTINGS_DIR, 'onboarding-seen.txt');
+
+ipcMain.handle('onboarding:is-done', () => {
+  try { return fs.existsSync(ONBOARDING_FILE); } catch { return false; }
+});
+
+ipcMain.handle('onboarding:mark-done', () => {
+  try {
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+    fs.writeFileSync(ONBOARDING_FILE, '1');
+    return { ok: true };
+  } catch { return { ok: false }; }
+});
 
 // Eski (userData tabanlı) konumlardan yeni sabit konuma taşı.
 // Birkaç olası eski isim deneriz: app.getName() değişmiş olabilir.
@@ -509,6 +540,22 @@ function migrateLegacySettings() {
 
 function getSettingsPath() {
   return SETTINGS_FILE;
+}
+
+function connectionSettingPaths() {
+  const paths = [SETTINGS_FILE];
+  try { paths.push(path.join(app.getPath('userData'), 'connection-settings.json')); } catch {}
+  const roaming = path.join(os.homedir(), 'AppData', 'Roaming');
+  for (const name of ['okul-nobet-programi', 'Okul Nöbet Programı', 'okul-nobet']) {
+    paths.push(path.join(roaming, name, 'connection-settings.json'));
+  }
+  return paths;
+}
+
+function clearConnectionSettings() {
+  for (const file of connectionSettingPaths()) {
+    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+  }
 }
 
 function loadSettings() {
@@ -542,11 +589,33 @@ function healthUrlFor(url) {
 function readServerLogTail(max = 900) {
   try {
     if (!serverLogPath || !fs.existsSync(serverLogPath)) return '';
-    const text = fs.readFileSync(serverLogPath, 'utf8').trim();
+    const text = fs.readFileSync(serverLogPath, 'utf8').slice(serverLogStartOffset).trim();
     return text.length > max ? text.slice(-max) : text;
   } catch {
     return '';
   }
+}
+
+function canListenOnPort(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.listen({ port, host: '0.0.0.0', exclusive: true }, () => {
+      probe.close((err) => resolve(!err));
+    });
+  });
+}
+
+async function findAvailablePort() {
+  const requested = Number(process.env.PORT);
+  const firstPort = Number.isInteger(requested) && requested >= 1024 && requested <= 65535
+    ? requested
+    : DEFAULT_SERVER_PORT;
+  const lastPort = Math.min(65535, firstPort + (MAX_SERVER_PORT - DEFAULT_SERVER_PORT));
+  for (let port = firstPort; port <= lastPort; port += 1) {
+    if (await canListenOnPort(port)) return port;
+  }
+  throw new Error(`Sunucu için ${firstPort}-${lastPort} aralığında boş port bulunamadı.`);
 }
 
 function killStaleServer() {
@@ -562,8 +631,11 @@ async function waitForServer(url, maxMs = 20000) {
   while (Date.now() - start < maxMs) {
     if (serverStartError || serverExited) return false;
     try {
-      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(1500) });
-      if (res.ok || (res.status > 0 && res.status < 500)) return true;
+      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(Math.min(1500, maxMs)) });
+      if (res.ok) {
+        const result = await res.json();
+        if (result?.ok === true) return true;
+      }
     } catch { /* henüz hazır değil */ }
     await new Promise(r => setTimeout(r, 300));
   }
@@ -588,14 +660,20 @@ async function startServer() {
   try { fs.mkdirSync(logDir, { recursive: true }); } catch { /* klasör zaten var */ }
   serverLogPath = path.join(logDir, 'server.log');
   const logFd = fs.openSync(serverLogPath, 'a');
+  serverLogStartOffset = fs.fstatSync(logFd).size;
   fs.writeSync(logFd, `\n---- ${new Date().toISOString()} ----\n`);
+  if (PORT !== DEFAULT_SERVER_PORT) {
+    fs.writeSync(logFd, `[server] ${DEFAULT_SERVER_PORT} portu dolu; ${PORT} portu kullanılacak.\n`);
+  }
 
   serverProcess = spawn(serverExe, [], {
     cwd: exeDir,
     detached: false,
+    env: { ...process.env, PORT: String(PORT) },
     stdio: ['ignore', logFd, logFd],
     windowsHide: true,
   });
+  fs.closeSync(logFd);
 
   serverProcess.on('error', (err) => {
     serverStartError = err?.message || String(err);
@@ -616,6 +694,52 @@ function serverFailureMessage() {
   return `Sunucu başlatılamadı.\n\n${detail}`;
 }
 
+/** Windows'ta native dialog sonrası yazı alanları kilitlenebilir; odak yenilenince düzelir. */
+function restoreWindowFocus(win) {
+  const target = win && !win.isDestroyed()
+    ? win
+    : (mainWindow && !mainWindow.isDestroyed() ? mainWindow : null);
+  if (!target || process.platform !== 'win32') return;
+  try {
+    target.blur();
+    target.focus();
+  } catch { /* odak yenilenemezse kullanıcı küçült-büyüt ile düzeltebilir */ }
+}
+
+ipcMain.on('window:restore-focus', (event) => {
+  restoreWindowFocus(BrowserWindow.fromWebContents(event.sender));
+  event.returnValue = true;
+});
+
+ipcMain.on('dialog:alert-sync', (event, message) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  dialog.showMessageBoxSync(win || undefined, {
+    type: 'info',
+    buttons: ['Tamam'],
+    defaultId: 0,
+    title: 'Okul Nöbet Programı',
+    message: String(message ?? ''),
+    noLink: true,
+  });
+  restoreWindowFocus(win);
+  event.returnValue = true;
+});
+
+ipcMain.on('dialog:confirm-sync', (event, message) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = dialog.showMessageBoxSync(win || undefined, {
+    type: 'question',
+    buttons: ['İptal', 'Tamam'],
+    defaultId: 1,
+    cancelId: 0,
+    title: 'Okul Nöbet Programı',
+    message: String(message ?? ''),
+    noLink: true,
+  });
+  restoreWindowFocus(win);
+  event.returnValue = result === 1;
+});
+
 function createMainWindow(url) {
   const iconPath = getIconPath();
 
@@ -630,6 +754,7 @@ function createMainWindow(url) {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
     show: false,
     backgroundColor: '#f8fafc',
@@ -644,6 +769,11 @@ function createMainWindow(url) {
     mainWindow.focus();
   });
 
+  // Yazıcı veya sistem penceresi kapandıktan sonra odak bozulursa yazı alanları açılır.
+  mainWindow.on('focus', () => {
+    try { mainWindow.webContents.focus(); } catch { /* yok sayılı */ }
+  });
+
   mainWindow.loadURL(url);
 
   // Önek karşılaştırması "http://192.168.1.5:3000.evil.com" gibi adresleri de geçirirdi; köken tam eşleşmeli.
@@ -655,23 +785,48 @@ function createMainWindow(url) {
   mainWindow.webContents.setWindowOpenHandler(({ url: linkUrl }) => {
     if (!linkUrl || linkUrl === '' || linkUrl === 'about:blank') return { action: 'allow' };
     if (isAppUrl(linkUrl)) return { action: 'allow' };
-    if (/^https?:\/\//i.test(linkUrl)) shell.openExternal(linkUrl);
+    if (/^(https?|mailto):/i.test(linkUrl)) shell.openExternal(linkUrl);
     return { action: 'deny' };
   });
 
   mainWindow.webContents.on('will-navigate', (event, target) => {
     if (isAppUrl(target)) return;
     event.preventDefault();
-    if (/^https?:\/\//i.test(target)) shell.openExternal(target);
+    if (/^(https?|mailto):/i.test(target)) shell.openExternal(target);
   });
 
   mainWindow.on('closed', () => { mainWindow = null; });
 
-  // Electron'un Windows yazdırma penceresi önizleme ve ölçek sunmaz.
-  // Çizelge Edge/Chrome'da açılır; tarayıcının yazdırma önizlemesinde
-  // Diğer ayarlar → Ölçek ile küçültülüp büyütülebilir.
+  // Yazıcı listesini ve yazıcı özelliklerini uygulama ayarları için sun.
+  ipcMain.removeHandler('printers:list');
+  ipcMain.handle('printers:list', async (event) => {
+    if (!isTrustedSender(event)) return [];
+    const printers = await event.sender.getPrintersAsync();
+    return printers.map((printer) => ({
+      name: printer.name,
+      displayName: printer.displayName || printer.name,
+      isDefault: !!printer.isDefault,
+      status: Number(printer.status) || 0,
+    }));
+  });
+
+  ipcMain.removeHandler('printer:properties');
+  ipcMain.handle('printer:properties', async (event, deviceName) => {
+    if (!isTrustedSender(event)) return { ok: false };
+    const name = typeof deviceName === 'string' ? deviceName.trim() : '';
+    if (!name || name.length > 200) return { ok: false };
+    const child = spawn('rundll32.exe', ['printui.dll,PrintUIEntry', '/e', '/n', name], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return { ok: true };
+  });
+
   ipcMain.removeHandler('print-pdf');
-  ipcMain.handle('print-pdf', async (_event, opts = {}) => {
+  ipcMain.handle('print-pdf', async (event, opts = {}) => {
+    if (!isTrustedSender(event)) return { ok: false, error: 'Bu işleme izin verilmiyor.' };
     const html = typeof opts?.html === 'string' ? opts.html : '';
     if (!html.trim()) return { ok: false, error: 'Yazdırılacak içerik yok.' };
     try {
@@ -685,41 +840,36 @@ function createMainWindow(url) {
         } catch { /* açık dosya silinemez */ }
       }
       const file = path.join(dir, `cizelge-${Date.now()}.html`);
-      fs.writeFileSync(file, html, 'utf8');
-      const openError = await openInBrowserPrintPreview(file);
+      // Chrome/Edge'in kendi yazdırma önizlemesi için belge varsayılan tarayıcıda açılır.
+      fs.writeFileSync(file, withBrowserPrintTrigger(html), 'utf8');
+      const openError = await shell.openPath(file);
       if (openError) return { ok: false, error: openError };
       return { ok: true };
     } catch (err) {
-      return { ok: false, error: err?.message || 'Yazdırma penceresi açılamadı.' };
+      return { ok: false, error: err?.message || 'Yazdırma önizlemesi açılamadı.' };
     }
   });
 }
 
-function findBrowserExecutable() {
-  const pf = process.env.PROGRAMFILES || 'C:\\Program Files';
-  const pf86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
-  const local = process.env.LOCALAPPDATA || '';
-  const candidates = [
-    path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    path.join(local, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    path.join(local, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-  ];
-  return candidates.find((p) => p && fs.existsSync(p)) || null;
-}
-
-function openInBrowserPrintPreview(file) {
-  const browser = findBrowserExecutable();
-  if (!browser) return shell.openPath(file);
-  try {
-    const child = spawn(browser, ['--new-window', file], { detached: true, stdio: 'ignore' });
-    child.unref();
-    return Promise.resolve('');
-  } catch {
-    return shell.openPath(file);
-  }
+function withBrowserPrintTrigger(html) {
+  const trigger = `<script>
+    window.addEventListener('load', async () => {
+      try {
+        if (document.fonts && document.fonts.ready) await document.fonts.ready;
+        await Promise.all(Array.from(document.images, (image) => {
+          if (image.complete) return Promise.resolve();
+          return new Promise((resolve) => {
+            image.addEventListener('load', resolve, { once: true });
+            image.addEventListener('error', resolve, { once: true });
+          });
+        }));
+      } catch {}
+      setTimeout(() => window.print(), 250);
+    }, { once: true });
+  </script>`;
+  return /<\/body\s*>/i.test(html)
+    ? html.replace(/<\/body\s*>/i, `${trigger}</body>`)
+    : `${html}${trigger}`;
 }
 
 // Mod seçim penceresi
@@ -734,13 +884,16 @@ function createSetupWindow() {
       title: 'Okul Nöbet Programı — Bağlantı Ayarı',
       icon: iconPath,
       webPreferences: {
-        contextIsolation: false,
-        nodeIntegration: true,
+        preload: path.join(__dirname, 'setup-preload.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
       },
       show: false,
       backgroundColor: '#0f172a',
       autoHideMenuBar: true,
     });
+    setupWindow = setupWin;
 
     setupWin.setMenuBarVisibility(false);
     setupWin.removeMenu();
@@ -786,11 +939,14 @@ function createSetupWindow() {
   <div class="ip-section" id="ipSection">
     <label>Ana Bilgisayarın IP Adresi</label>
     <input type="text" id="ipInput" placeholder="Örn: 192.168.1.50 veya https://sunucu-adresi" oninput="validateIp()">
-    <div class="hint">Ana bilgisayarın başlık çubuğundaki IP adresini yazın. Adres başka bir ağdaysa tam adresi girin (ör. https://sunucu). Ana bilgisayar kapalıyken verilere ulaşılamaz.</div>
+    <div class="hint">Ana bilgisayarda kullanıcı menüsünde yazan adresi girin. Aynı kurum kodu ve şifre hem yönetici hem öğretmen için geçerlidir. Ana bilgisayar kapalıyken verilere ulaşılamaz.</div>
   </div>
   <button class="btn" id="startBtn" onclick="start()" disabled>Başla</button>
 <script>
-  const { ipcRenderer } = require('electron');
+  // Dikkat: 'setupAPI' global olarak contextBridge ile tanımlanır. Burada
+  // 'const setupAPI = ...' yazmak "Identifier already declared" SyntaxError
+  // üretir ve script'in tamamı çalışmaz. Bu yüzden her zaman window.setupAPI
+  // üzerinden erişiyoruz.
   let mode = null;
   function selectMode(m) {
     mode = m;
@@ -805,8 +961,9 @@ function createSetupWindow() {
     document.getElementById('startBtn').disabled = !val;
   }
   function start() {
+    if (!window.setupAPI) return;
     const ip = document.getElementById('ipInput').value.trim();
-    ipcRenderer.send('setup-done', { mode, serverIp: ip || '' });
+    window.setupAPI.finish({ mode, serverIp: ip || '' });
   }
 </script></body></html>`;
 
@@ -817,18 +974,41 @@ function createSetupWindow() {
 
     setupWin.once('ready-to-show', () => setupWin.show());
 
-    ipcMain.once('setup-done', (_e, data) => {
+    // Sonuç yalnızca kurulum penceresinden ve beklenen biçimde kabul edilir.
+    const onSetupDone = (event, data) => {
+      if (event.sender !== setupWin.webContents) return;
+      ipcMain.removeListener('setup-done', onSetupDone);
+      const result = {
+        mode: data?.mode === 'client' ? 'client' : 'server',
+        serverIp: typeof data?.serverIp === 'string' ? data.serverIp.trim().slice(0, 200) : '',
+      };
       setupWin.close();
-      resolve(data);
-    });
+      resolve(result);
+    };
+    ipcMain.on('setup-done', onSetupDone);
 
     setupWin.on('closed', () => {
+      ipcMain.removeListener('setup-done', onSetupDone);
+      if (setupWindow === setupWin) setupWindow = null;
       resolve(null);
     });
   });
 }
 
 // Sunucu modunda başlık çubuğunda IP göster
+function allowLanFirewall() {
+  if (process.platform !== 'win32') return;
+  const name = 'Okul Nobet Programi';
+  execFile('netsh', ['advfirewall', 'firewall', 'delete', 'rule', `name=${name}`], () => {
+    execFile('netsh', [
+      'advfirewall', 'firewall', 'add', 'rule',
+      `name=${name}`,
+      'dir=in', 'action=allow', 'protocol=TCP', `localport=${PORT}`,
+      'profile=private',
+    ], () => {});
+  });
+}
+
 function getLocalIp() {
   try {
     const nets = os.networkInterfaces();
@@ -1084,17 +1264,28 @@ app.whenReady().then(async () => {
     return;
   }
 
-  // İlk çalışma veya ayar yoksa mod seçim ekranı göster
-  if (!settings) {
+  // İlk çalışma, elle yeniden kurulum veya kayıtlı seçim silinmişse sor.
+  // Sessiz güncelleme bu dosyayı yazmaz; açık olan ana bilgisayar seçimi durur.
+  const askConnection = fs.existsSync(ASK_CONNECTION_FILE);
+  if (!settings || askConnection) {
     const result = await createSetupWindow();
     if (!result) { app.quit(); return; }
     settings = { mode: result.mode, serverIp: result.serverIp };
     saveSettings(settings);
+    try { fs.unlinkSync(ASK_CONNECTION_FILE); } catch {}
   }
 
   appMode = settings.mode;
 
   if (appMode === 'server') {
+    try {
+      PORT = await findAvailablePort();
+    } catch (err) {
+      dialog.showErrorBox('Sunucu başlatılamadı', err?.message || 'Boş ağ portu bulunamadı.');
+      app.quit();
+      return;
+    }
+    allowLanFirewall();
     await startServer();
     serverUrl = `http://127.0.0.1:${PORT}`;
     const ready = await waitForServer(serverUrl, 45000);
@@ -1111,9 +1302,16 @@ app.whenReady().then(async () => {
       mainWindow.setTitle(`Okul Nöbet Programı — Sunucu: ${localIp}:${PORT}`);
     }
   } else {
-    // İstemci modu: sunucu IP'sine bağlan
-    serverUrl = resolveServerUrl(settings.serverIp);
-    const ready = await waitForServer(serverUrl, 10000);
+    // Port belirtilmemişse ana bilgisayarın varsayılan/fallback portlarını dene.
+    const candidates = serverUrlCandidates(settings.serverIp);
+    let ready = false;
+    for (const candidate of candidates) {
+      serverUrl = candidate;
+      if (await waitForServer(candidate, 500)) {
+        ready = true;
+        break;
+      }
+    }
     if (!ready) {
       const response = await dialog.showMessageBox({
         type: 'error',

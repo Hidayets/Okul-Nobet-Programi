@@ -1,9 +1,16 @@
-import { useEffect, useState } from 'react';
-import { createPortal } from 'react-dom';
-import { Printer, X } from 'lucide-react';
+import { useEffect, useRef } from 'react';
 import { buildPrintDocument } from '../lib/printDocument';
 
-type PrintPdfResult = { ok?: boolean; error?: string };
+type PrintPdfResult = { ok?: boolean; error?: string; canceled?: boolean };
+
+type ElectronPrintApi = {
+  printPdf?: (opts: Record<string, unknown>) => Promise<PrintPdfResult>;
+};
+
+function electronApi(): ElectronPrintApi | null {
+  const api = (window as unknown as { electronAPI?: ElectronPrintApi }).electronAPI;
+  return api?.printPdf ? api : null;
+}
 
 function collectDocumentCss(): string {
   const chunks: string[] = [];
@@ -21,19 +28,6 @@ function collectDocumentCss(): string {
   return chunks.join('\n');
 }
 
-async function requestDocumentPrint(title: string, html: string, page: 'portrait' | 'landscape'): Promise<string | null> {
-  const api = (window as unknown as {
-    electronAPI?: { printPdf?: (opts: { html: string }) => Promise<PrintPdfResult> };
-  }).electronAPI;
-  if (api?.printPdf) {
-    const result = await api.printPdf({ html: buildPrintDocument(title, html, page, collectDocumentCss()) });
-    if (!result?.ok) return result?.error || 'Yazdırma penceresi açılamadı.';
-    return null;
-  }
-  window.print();
-  return null;
-}
-
 /** Ekranda gizli duran yazdırma bölümünün HTML'ini alır. */
 export function capturePrintHtml(selector: string): string | null {
   const el = document.querySelector(selector);
@@ -45,106 +39,52 @@ interface Props {
   title: string;
   html: string;
   page?: 'portrait' | 'landscape';
+  note?: string;
   onClose: () => void;
 }
 
+/** Yazdır deyince belge varsayılan tarayıcıda açılır ve tarayıcı önizlemesi gösterilir. */
 export default function PrintPreview({ title, html, page = 'portrait', onClose }: Props) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+    let cancelled = false;
+    const finish = () => {
+      if (!cancelled) onCloseRef.current();
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
-  const onPrint = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const message = await requestDocumentPrint(title, html, page);
-      if (message) setError(message);
-    } catch {
-      setError('Yazdırma hazırlanamadı.');
-    } finally {
-      setBusy(false);
+    const api = electronApi();
+    const documentHtml = buildPrintDocument(title, html, page, collectDocumentCss(), { marginMm: 12 });
+    if (!api?.printPdf) {
+      const preview = window.open('', '_blank');
+      if (preview) {
+        preview.document.open();
+        preview.document.write(documentHtml);
+        preview.document.close();
+        preview.focus();
+        preview.print();
+      }
+      finish();
+      return () => { cancelled = true; };
     }
-  };
 
-  return createPortal(
-    <div className="print-preview-root fixed inset-0 z-[80] flex flex-col bg-slate-900/70">
-      <style>{`
-        .print-preview-sheet .hidden.print\\:block { display: block !important; }
-        .print-preview-sheet .print\\:hidden { display: none !important; }
-        .print-preview-sheet .absence-print-section,
-        .print-preview-sheet .duty-counts-print-section { display: block !important; }
-        @media print {
-          @page { size: A4 ${page}; margin: 1cm; }
-          html, body {
-            height: auto !important;
-            overflow: visible !important;
-            background: #fff !important;
-          }
-          #root { display: none !important; }
-          .print-preview-root {
-            position: static !important;
-            display: block !important;
-            background: white !important;
-            height: auto !important;
-            overflow: visible !important;
-            inset: auto !important;
-          }
-          .print-preview-toolbar { display: none !important; }
-          .print-preview-scroll {
-            overflow: visible !important;
-            padding: 0 !important;
-            background: white !important;
-          }
-          .print-preview-sheet {
-            box-shadow: none !important;
-            margin: 0 !important;
-            max-width: none !important;
-            width: 100% !important;
-          }
+    api.printPdf({ html: documentHtml })
+      .then((result) => {
+        if (cancelled) return;
+        if (result && !result.ok && !result.canceled && result.error) {
+          window.alert(result.error);
         }
-      `}</style>
-      <div className="print-preview-toolbar flex items-center justify-between gap-3 px-4 py-3 bg-slate-900 text-white shrink-0">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold truncate">Önizleme — {title}</div>
-          <div className={`text-xs ${error ? 'text-rose-300' : 'text-slate-400'}`}>
-            {error
-              ? error
-              : 'Yazdır, önizlemeli yazıcı penceresini açar. Küçültmek veya büyütmek için orada Diğer ayarlar → Ölçek kullanılır.'}
-          </div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600"
-          >
-            <span className="inline-flex items-center gap-1.5"><X className="w-4 h-4" /> Kapat</span>
-          </button>
-          <button
-            type="button"
-            onClick={onPrint}
-            disabled={busy}
-            className="px-3 py-1.5 rounded-lg text-sm font-medium bg-indigo-500 hover:bg-indigo-400 disabled:opacity-60"
-          >
-            <span className="inline-flex items-center gap-1.5"><Printer className="w-4 h-4" /> {busy ? 'Hazırlanıyor…' : 'Yazdır'}</span>
-          </button>
-        </div>
-      </div>
-      <div className="print-preview-scroll flex-1 overflow-auto p-6">
-        <div
-          className="print-preview-sheet bg-white text-slate-900 mx-auto shadow-2xl"
-          style={{ maxWidth: page === 'landscape' ? '1100px' : '820px', padding: '24px' }}
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
-      </div>
-    </div>,
-    document.body,
-  );
+      })
+      .catch(() => {
+        if (!cancelled) window.alert('Yazdırma hazırlanamadı.');
+      })
+      .finally(() => {
+        finish();
+      });
+
+    return () => { cancelled = true; };
+  }, [title, html, page]);
+
+  return null;
 }

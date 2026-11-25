@@ -14,6 +14,12 @@ export default function SuperAdminPanel({ onLogout, embedded = false, onSelectKu
   const [licenses, setLicenses] = useState<License[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [githubRepo, setGithubRepo] = useState('');
+  const [githubToken, setGithubToken] = useState('');
+  const [githubConfigured, setGithubConfigured] = useState(false);
+  const [githubSaving, setGithubSaving] = useState(false);
+  const [githubNote, setGithubNote] = useState('');
+  const [githubNoteIsError, setGithubNoteIsError] = useState(false);
 
   // Yeni lisans formu
   const [showNewForm, setShowNewForm] = useState(false);
@@ -111,8 +117,63 @@ export default function SuperAdminPanel({ onLogout, embedded = false, onSelectKu
     }
   };
 
+  const fetchGithub = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch('/api/licenses/github', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setGithubConfigured(!!data.configured);
+      setGithubRepo(data.repo || '');
+      if (data.sync?.message) {
+        setGithubNoteIsError(!data.sync.ok);
+        setGithubNote(data.sync.message);
+      }
+    } catch { /* bağlantı yoksa kutu boş kalır */ }
+  };
+
+  const saveGithub = async () => {
+    const repo = githubRepo.trim();
+    if (!repo) return;
+    setGithubSaving(true);
+    setGithubNote('');
+    setGithubNoteIsError(false);
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch('/api/licenses/github', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ repo, token: githubToken.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setGithubNoteIsError(true);
+        setGithubNote(data.error || 'GitHub bağlantısı kurulamadı.');
+        return;
+      }
+      setGithubConfigured(true);
+      setGithubToken('');
+      setGithubNoteIsError(false);
+      setGithubNote(data.sync?.message || 'GitHub bağlandı.');
+      await fetchLicenses();
+    } catch {
+      setGithubNoteIsError(true);
+      setGithubNote('Bağlantı hatası.');
+    } finally {
+      setGithubSaving(false);
+    }
+  };
+
   useEffect(() => {
-    fetchLicenses();
+    (async () => {
+      await fetchLicenses();
+      await fetchGithub();
+    })();
   }, []);
 
   const handleCreateLicense = async (e: React.FormEvent) => {
@@ -465,6 +526,41 @@ export default function SuperAdminPanel({ onLogout, embedded = false, onSelectKu
           </button>
         </div>
 
+        <div className="mb-6 rounded-xl border border-slate-700 bg-slate-800 p-4 space-y-3">
+          <h3 className="font-semibold">GitHub lisans defteri</h3>
+          <p className="text-sm text-slate-400">
+            Lisanslar özel bir GitHub deposunda durur. Okulda bir kez bağlayınca listedeki okullar oraya yazılır.
+            Evde veya başka bilgisayarda aynı depo ve anahtarı yazınca aynı listeyi görür, yeni lisans da oraya eklenir.
+            Depo mutlaka <span className="text-slate-200">Private</span> olmalı.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <input
+              type="text"
+              value={githubRepo}
+              onChange={(e) => setGithubRepo(e.target.value)}
+              placeholder="kullanici-adiniz/okul-lisanslari"
+              className="px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+            />
+            <input
+              type="password"
+              value={githubToken}
+              onChange={(e) => setGithubToken(e.target.value)}
+              placeholder={githubConfigured ? 'Anahtar kayıtlı. Değiştirmek için yeniden yazın' : 'GitHub erişim anahtarı'}
+              className="px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={saveGithub}
+            disabled={githubSaving || !githubRepo.trim()}
+            className="px-4 py-2 rounded-lg text-sm font-medium bg-purple-600 hover:bg-purple-700 disabled:opacity-50"
+          >
+            {githubSaving ? 'Eşitleniyor...' : 'Kaydet ve eşitle'}
+          </button>
+          {githubNote && (
+            <p className={`text-sm ${githubNoteIsError ? 'text-red-300' : 'text-emerald-300'}`}>{githubNote}</p>
+          )}
+        </div>
         <DatabaseImportSection onImported={fetchLicenses} />
 
         {/* Acil durum bandı */}

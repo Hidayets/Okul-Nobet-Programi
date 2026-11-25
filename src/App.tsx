@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useMemo, useCallback } from 'react';
+import { Fragment, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { cn } from './lib/utils';
 import AppShell, { AppTab } from './components/AppShell';
@@ -17,11 +17,13 @@ import Register from './components/Register';
 import OnboardingTour, { ONBOARDING_STORAGE_KEY } from './components/OnboardingTour';
 import UpdateNotifier, { UpdateStatus } from './components/UpdateNotifier';
 import LicenseExpiryWarning from './components/LicenseExpiryWarning';
+import LicenseContactDialog, { CONTACT_EMAIL } from './components/LicenseContactDialog';
 import { formatLicenseDateLongTr } from './lib/licenseDates';
 import { useAuth } from './AuthContext';
 import { useApiSync } from './hooks/useApiSync';
 import { useApiDoc } from './hooks/useApiDoc';
 import { unifyTeachers } from './lib/teacherMatching';
+import { MY_TEACHER_EVENT, readMyTeacherId } from './lib/myTeacher';
 import { getAuthHeaders, setClientName } from './lib/apiHeaders';
 import { useMebCalendarSync, MebSyncOutcome } from './hooks/useMebCalendarSync';
 import { useUndoableUpdates } from './hooks/useUndoableUpdates';
@@ -50,18 +52,8 @@ export default function App() {
   }, []);
 
   // Lisans pasifleştirildi/dolduğunda backend 403 + licenseStatus döner ve
-  // AuthContext oturumu kapatır. Burada kullanıcıya tek seferlik bir uyarı
-  // göster ve onlara Login ekranını sun.
-  useEffect(() => {
-    if (licenseLockout) {
-      // Sayfa modal'lar arasında bocalamasın diye küçük bir gecikmeyle göster.
-      window.setTimeout(() => {
-        try {
-          alert(licenseLockout.message);
-        } catch {}
-      }, 0);
-    }
-  }, [licenseLockout]);
+  // AuthContext oturumu kapatır; giriş ekranında iletişim penceresi bir kez gösterilir.
+  const [dismissedLockout, setDismissedLockout] = useState<typeof licenseLockout>(null);
 
   // Lisans bitimine 30 gün (1 ay) veya daha az kaldıysa: her uygulama açılışında (yeni oturum)
   // bir kez tam ekran uyarı gösterilir. Oturumu kapatıp tekrar açınca yeniden gösterilir.
@@ -104,7 +96,7 @@ export default function App() {
   const scopedCollection = (name: string) => `${name}__${activeYear}`;
 
   const [teachers, setTeachers, teachersLoaded] = useApiSync<Teacher>(scopedCollection('teachers'), []);
-  const [classes, setClasses] = useApiSync<ClassInfo>(scopedCollection('classes'), []);
+  const [classes, setClasses, classesLoaded] = useApiSync<ClassInfo>(scopedCollection('classes'), []);
   const [locations, setLocations, locationsLoaded] = useApiSync<Location>(scopedCollection('locations'), []);
   const orderedLocations = useMemo(() => sortLocationsByOrder(locations), [locations]);
   const [assignments, setAssignments, assignmentsLoaded] = useApiSync<Assignment>(scopedCollection('assignments'), []);
@@ -224,13 +216,121 @@ export default function App() {
     }
   }, [availableYears, activeYear]);
 
+  // Ağustos itibarıyla yeni eğitim-öğretim yılına geçildiğinde nöbet verileri
+  // (görevlendirme, devamsızlık, takas, çift nöbet, devir kayıtları, arşivler) boş başlar.
+  // Öğretmen listesi, nöbet yerleri (yerleşim) ve sınıf listesi önceki dönemden bir kez
+  // otomatik aktarılır. Eski dönemlerin verileri silinmez; yıl seçicisinden görülebilir.
+  const yearSetupStartedRef = useRef('');
+  useEffect(() => {
+    if (!user || user.role !== 'admin') return;
+    if (!teachersLoaded || !locationsLoaded || !classesLoaded) return;
+    // Otomatik aktarım yalnızca güncel eğitim-öğretim yılına geçildiğinde yapılır.
+    if (activeYear !== getCurrentAcademicYear()) return;
+    if (yearSetupStartedRef.current === activeYear) return;
+
+    const needsTeachers = teachers.length === 0;
+    const needsLocations = locations.length === 0;
+    const needsClasses = classes.length === 0;
+    // Hedef dönemde üç liste de doluysa aktarılacak bir şey yok.
+    if (!needsTeachers && !needsLocations && !needsClasses) return;
+
+    const earlierYears = availableYears.filter((y) => y < activeYear);
+    const sourceYear = earlierYears[earlierYears.length - 1];
+    if (!sourceYear) return;
+
+    // Aynı anda ikinci kez çalışmayı önlemek için senkron işaretle.
+    yearSetupStartedRef.current = activeYear;
+
+    const readCollection = async <T,>(collection: string): Promise<(T & { _rev?: string })[]> => {
+      try {
+        const res = await fetch(`/api/data/${collection}`, { headers: getAuthHeaders() });
+        if (!res.ok) return [];
+        const data = await res.json();
+        return Array.isArray(data) ? data : [];
+      } catch {
+        return [];
+      }
+    };
+
+    (async () => {
+      const [sourceTeachers, sourceLocations, sourceClasses] = await Promise.all([
+        readCollection<Teacher>(`teachers__${sourceYear}`),
+        readCollection<Location>(`locations__${sourceYear}`),
+        readCollection<ClassInfo>(`classes__${sourceYear}`),
+      ]);
+
+      // Ders programı (yıla özel) yeni döneme taşınmaz; isim ve nöbet tercihleri korunur.
+      const newTeachers: Teacher[] = needsTeachers
+        ? sourceTeachers.map(({ _rev, schedule, ...rest }) => rest)
+        : [];
+
+      // Yer/sınıf aktarımında öğretmen referansları hedef dönemin öğretmenleriyle eşlenir.
+      const targetTeachers = needsTeachers ? newTeachers : teachers;
+      const sourceNameById = new Map<string, string>(
+        sourceTeachers.map((t) => [t.id, t.name] as [string, string]),
+      );
+      const targetIdByName = new Map<string, string>(
+        targetTeachers.map((t) => [t.name.trim().toLocaleLowerCase('tr'), t.id] as [string, string]),
+      );
+      const mapTeacherId = (sourceId: string): string => {
+        if (targetTeachers.some((t) => t.id === sourceId)) return sourceId;
+        const name = sourceNameById.get(sourceId);
+        if (!name) return sourceId;
+        return targetIdByName.get(name.trim().toLocaleLowerCase('tr')) ?? sourceId;
+      };
+
+      const newLocations: Location[] = needsLocations
+        ? sourceLocations.map(({ _rev, ...loc }) => ({
+            ...loc,
+            duties: (loc.duties || []).map((d) => ({ ...d, teacherId: mapTeacherId(d.teacherId) })),
+            assignedTeacherIds: loc.assignedTeacherIds
+              ? [...new Set(loc.assignedTeacherIds.map(mapTeacherId))]
+              : loc.assignedTeacherIds,
+          }))
+        : [];
+
+      // Sınıf listesi taşınır; sınıf ders programı (yıla özel) taşınmaz.
+      const newClasses: ClassInfo[] = needsClasses
+        ? sourceClasses.map(({ _rev, ...cls }) => ({ ...cls, schedule: {} }))
+        : [];
+
+      if (newTeachers.length > 0) await setTeachers(newTeachers);
+      if (newLocations.length > 0) await setLocations(newLocations);
+      if (newClasses.length > 0) await setClasses(newClasses);
+    })();
+  }, [
+    user, teachersLoaded, locationsLoaded, classesLoaded, activeYear,
+    teachers, locations, classes, availableYears,
+    setTeachers, setLocations, setClasses,
+  ]);
+
   useEffect(() => {
     if (!user || user.role === 'superadmin') return;
-    try {
-      if (!localStorage.getItem(ONBOARDING_STORAGE_KEY)) {
-        setTourOpen(true);
+    let cancelled = false;
+    // Tanıtım turu yalnızca ilk kurulumda gösterilir. Electron'da bayrak kurulum
+    // bazında (origin'den bağımsız) dosyada tutulur; tarayıcıda localStorage'a düşer.
+    const api = (window as Window & {
+      electronAPI?: {
+        isOnboardingDone?: () => Promise<boolean>;
+        markOnboardingDone?: () => void;
+      };
+    }).electronAPI;
+    (async () => {
+      let done = false;
+      try {
+        done = api?.isOnboardingDone
+          ? await api.isOnboardingDone()
+          : !!localStorage.getItem(ONBOARDING_STORAGE_KEY);
+      } catch {
+        try { done = !!localStorage.getItem(ONBOARDING_STORAGE_KEY); } catch { done = false; }
       }
-    } catch {}
+      if (cancelled || done) return;
+      setTourOpen(true);
+      // İlk gösterimde işaretle: uygulama tur açıkken kapansa bile bir daha otomatik açılmaz.
+      try { localStorage.setItem(ONBOARDING_STORAGE_KEY, '1'); } catch {}
+      try { api?.markOnboardingDone?.(); } catch {}
+    })();
+    return () => { cancelled = true; };
   }, [user]);
 
   // Öğretmen listesinde aynı kişiyi temsil eden mükerrer kayıtları
@@ -245,6 +345,26 @@ export default function App() {
     setTeachers(unified);
     handleTeacherIdsMerged(idRemap);
   }, [teachers, user, setTeachers, handleTeacherIdsMerged]);
+
+  const [myTeacherId, setMyTeacherId] = useState('');
+  useEffect(() => {
+    if (!user || user.role !== 'teacher') {
+      setMyTeacherId('');
+      return;
+    }
+    const read = () => setMyTeacherId(readMyTeacherId(user.kurumKodu));
+    read();
+    window.addEventListener(MY_TEACHER_EVENT, read);
+    window.addEventListener('storage', read);
+    return () => {
+      window.removeEventListener(MY_TEACHER_EVENT, read);
+      window.removeEventListener('storage', read);
+    };
+  }, [user]);
+  const schoolName = (schoolInfo.okulAdi || '').trim() || (license?.okulAdi || '').trim();
+  const teacherName = user?.role === 'teacher'
+    ? (teachers.find((t) => t.id === myTeacherId)?.name || '')
+    : '';
 
   // Electron uygulama bilgisini çek (paketli sürümde otoriter sürüm)
   useEffect(() => {
@@ -332,10 +452,21 @@ export default function App() {
   }
 
   if (!user) {
-    if (showRegister) {
-      return <Register onBackToLogin={() => setShowRegister(false)} />;
-    }
-    return <Login onSwitchToRegister={() => setShowRegister(true)} />;
+    return (
+      <>
+        {showRegister
+          ? <Register onBackToLogin={() => setShowRegister(false)} />
+          : <Login onSwitchToRegister={() => setShowRegister(true)} />}
+        {licenseLockout && licenseLockout !== dismissedLockout && (
+          <LicenseContactDialog
+            reason={licenseLockout.reason}
+            message={licenseLockout.message}
+            kurumKodu={licenseLockout.kurumKodu}
+            onClose={() => setDismissedLockout(licenseLockout)}
+          />
+        )}
+      </>
+    );
   }
 
   const banners = (
@@ -358,12 +489,12 @@ export default function App() {
               {license.daysRemaining < 0 ? (
                 <>
                   <span className="font-semibold">{formatLicenseDateLongTr(license.expiresAt)} tarihinde lisans süreniz dolmuştur.</span>{' '}
-                  <a href="mailto:okulcozumleri@gmail.com" className="font-semibold underline">okulcozumleri@gmail.com</a>
+                  <a href={`mailto:${CONTACT_EMAIL}`} className="font-semibold underline">{CONTACT_EMAIL}</a>
                 </>
               ) : (
                 <>
                   <span className="font-semibold">{formatLicenseDateLongTr(license.expiresAt)} tarihinde lisans süreniz dolacaktır.</span>{' '}
-                  <a href="mailto:okulcozumleri@gmail.com" className="font-semibold underline">okulcozumleri@gmail.com</a>
+                  <a href={`mailto:${CONTACT_EMAIL}`} className="font-semibold underline">{CONTACT_EMAIL}</a>
                 </>
               )}
             </div>
@@ -424,6 +555,8 @@ export default function App() {
       isAdmin={isAdmin}
       isSuperAdmin={isSuperAdmin}
       user={user}
+      schoolName={schoolName}
+      teacherName={teacherName}
       onSignOut={signOut}
       onTourOpen={() => setTourOpen(true)}
       onCheckUpdate={handleCheckUpdate}
@@ -465,6 +598,7 @@ export default function App() {
             onLocationsRemoved={handleLocationsRemoved}
             teachers={teachers}
             schoolDayCount={schoolInfo.settings?.schoolDays?.length}
+            schoolDays={schoolInfo.settings?.schoolDays}
           />
         )}
         {activeTab === 'generator' && isAdmin && (

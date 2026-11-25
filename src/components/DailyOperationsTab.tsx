@@ -2,11 +2,12 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { format, parseISO, getDay, addDays, isSameWeek, isAfter, isBefore, endOfWeek } from 'date-fns';
 import { tr } from 'date-fns/locale';
 import { v4 as uuidv4 } from 'uuid';
-import { Calendar as CalendarIcon, UserX, UserCheck, RefreshCw, AlertTriangle, BarChart3, Clock, Printer, ChevronDown, ShieldAlert, Users, ArrowRightLeft, X, Plus } from 'lucide-react';
+import { Calendar as CalendarIcon, UserX, UserCheck, RefreshCw, AlertTriangle, BarChart3, Clock, Printer, ChevronDown, ShieldAlert, Users, ArrowRightLeft, X, Plus, FileSpreadsheet } from 'lucide-react';
 import { Teacher, Assignment, Absence, Substitution, SchoolInfo, DEFAULT_SCHOOL_SETTINGS, calculateLessonTimes, AbsenceReason, ABSENCE_REASONS, Location, canTeacherDutyOnDay } from '../types';
 import { assignVicePrincipalsToDates } from '../lib/vicePrincipalDuty';
 import { assignSubstitutes } from '../lib/substituteAssignment';
 import PrintPreview from './PrintPreview';
+import { downloadExcel } from '../lib/downloadExcel';
 
 function esc(value: unknown): string {
   return String(value ?? '')
@@ -656,6 +657,31 @@ export default function DailyOperationsTab({
   const okulAdi = schoolInfo.okulAdi || '';
   const mudur = schoolInfo.okulMuduru || '';
 
+  const handleDownloadSubstitutions = () => {
+    if (printableGrid.length === 0) {
+      alert('İndirilecek devamsız öğretmen bulunmuyor.');
+      return;
+    }
+    const hours = Array.from({ length: settings.lessonCount }, (_, i) => `${i + 1}. ders`);
+    const rows: (string | number)[][] = [
+      [okulAdi || 'Ders görevlendirme çizelgesi', formattedDate],
+      [],
+    ];
+    for (const row of printableGrid) {
+      rows.push(['Gelmeyen öğretmen', row.absentName, 'Sebep', row.reasonLabel]);
+      rows.push(['', ...hours]);
+      rows.push(['Sınıf', ...hours.map((_, i) => row.classesByHour[i + 1] || '-')]);
+      rows.push(['Görevlendirilen', ...hours.map((_, i) => row.substitutesByHour[i + 1] || '-')]);
+      rows.push([]);
+    }
+    const stamp = format(parseISO(selectedDate), 'yyyy-MM-dd');
+    downloadExcel(`Gunluk_Islemler_${stamp}.xlsx`, [{
+      name: 'Günlük işlemler',
+      rows,
+      colWidths: [22, 28, 16, 24, ...hours.map(() => 14)],
+    }]);
+  };
+
   const handlePrintSubstitutions = () => {
     if (printableGrid.length === 0) {
       alert('Yazdırılacak devamsız öğretmen bulunmuyor.');
@@ -667,45 +693,36 @@ export default function DailyOperationsTab({
       (_, i) => `<th>${i + 1}. Ders</th>`,
     ).join('');
 
-    const absentSections = printableGrid.map(row => `
-      <div class="teacher-block">
-        <table class="info-table">
-          <tr>
-            <td class="info-label">Gelmeyen Öğretmen</td>
-            <td class="info-value">${esc(row.absentName)}</td>
-            <td class="info-label">Gelmeme Sebebi</td>
-            <td class="info-value">${esc(row.reasonLabel)}</td>
-          </tr>
-        </table>
-        <table class="schedule-table">
-          <thead>
-            <tr>
-              <th class="row-label"></th>
-              ${lessonHeaders}
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td class="row-label">Sınıf</td>
-              ${Array.from({ length: settings.lessonCount }, (_, i) => {
-                const val = row.classesByHour[i + 1];
-                return `<td class="${val === '-' ? 'empty-cell' : 'class-cell'}">${esc(val)}</td>`;
-              }).join('')}
-            </tr>
-            <tr>
-              <td class="row-label">Görevlendirilen Öğretmen</td>
-              ${Array.from({ length: settings.lessonCount }, (_, i) => {
-                const classVal = row.classesByHour[i + 1];
-                const subVal = row.substitutesByHour[i + 1];
-                const display = classVal !== '-' && subVal !== '-'
-                  ? `${esc(subVal)}<br><span class="sub-class">(${esc(classVal)})</span>`
-                  : '-';
-                return `<td class="${display === '-' ? 'empty-cell' : 'sub-cell'}">${display}</td>`;
-              }).join('')}
-            </tr>
-          </tbody>
-        </table>
-      </div>
+    // Birden fazla devamsız öğretmen aynı tabloda, tek çerçeve içinde gösterilir.
+    const totalColumns = settings.lessonCount + 1;
+    const absentRows = printableGrid.map(row => `
+      <tr class="teacher-info-row">
+        <td class="teacher-info" colspan="${totalColumns}">
+          <span class="info-label">Gelmeyen Öğretmen:</span>
+          <span class="info-value">${esc(row.absentName)}</span>
+          <span class="info-sep">•</span>
+          <span class="info-label">Gelmeme Sebebi:</span>
+          <span class="info-value">${esc(row.reasonLabel)}</span>
+        </td>
+      </tr>
+      <tr>
+        <td class="row-label">Sınıf</td>
+        ${Array.from({ length: settings.lessonCount }, (_, i) => {
+          const val = row.classesByHour[i + 1];
+          return `<td class="${val === '-' ? 'empty-cell' : 'class-cell'}">${esc(val)}</td>`;
+        }).join('')}
+      </tr>
+      <tr>
+        <td class="row-label">Görevlendirilen Öğretmen</td>
+        ${Array.from({ length: settings.lessonCount }, (_, i) => {
+          const classVal = row.classesByHour[i + 1];
+          const subVal = row.substitutesByHour[i + 1];
+          const display = classVal !== '-' && subVal !== '-'
+            ? `${esc(subVal)}<br><span class="sub-class">(${esc(classVal)})</span>`
+            : '-';
+          return `<td class="${display === '-' ? 'empty-cell' : 'sub-cell'}">${display}</td>`;
+        }).join('')}
+      </tr>
     `).join('');
 
     const printHtml = `
@@ -715,40 +732,32 @@ export default function DailyOperationsTab({
         <meta charset="UTF-8">
         <title>Ders Görevlendirme Çizelgesi</title>
         <style>
-          @page { size: landscape; margin: 1cm; }
           .daily-print-sheet, .daily-print-sheet * { box-sizing: border-box; }
-          .daily-print-sheet { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 16px; color: #0f172a; }
+          .daily-print-sheet { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; color: #0f172a; }
           .page-frame {
             border: 2px solid #000;
-            padding: 16px;
+            padding: 10px;
           }
-          .header { text-align: center; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 2px solid #000; }
+          .header { text-align: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 2px solid #000; }
           .header div { margin-bottom: 2px; }
-          .teacher-block {
-            border: 2px solid #000;
-            margin-bottom: 14px;
-            padding: 0;
-            page-break-inside: avoid;
-          }
-          .teacher-block:last-of-type { margin-bottom: 0; }
           .daily-print-sheet table { border-collapse: collapse; width: 100%; }
-          .info-table td {
-            border: 1.5px solid #000;
-            padding: 7px 10px;
-            font-size: 12px;
-          }
-          .info-label {
-            font-weight: 700;
+          .schedule-table thead { display: table-header-group; }
+          .schedule-table tr { page-break-inside: avoid; break-inside: avoid; }
+          .teacher-info-row td {
             background-color: #e2e8f0;
-            width: 18%;
+            border: 1.5px solid #000;
+            padding: 5px 8px;
+            font-size: 11px;
             text-align: left;
           }
-          .info-value { font-weight: 600; width: 32%; }
+          .teacher-info .info-label { font-weight: 700; }
+          .teacher-info .info-value { font-weight: 600; }
+          .teacher-info .info-sep { color: #64748b; margin: 0 8px; }
           .schedule-table th,
           .schedule-table td {
             border: 1.5px solid #000;
-            padding: 7px 6px;
-            font-size: 11px;
+            padding: 4px 5px;
+            font-size: 10px;
             text-align: center;
             vertical-align: middle;
           }
@@ -759,24 +768,24 @@ export default function DailyOperationsTab({
           .row-label {
             text-align: left;
             font-weight: 700;
-            padding-left: 10px !important;
+            padding-left: 8px !important;
             background-color: #f1f5f9;
-            min-width: 130px;
-            width: 130px;
+            min-width: 118px;
+            width: 118px;
           }
           .class-cell { font-weight: 600; }
-          .sub-cell { font-weight: 600; line-height: 1.3; }
-          .sub-class { font-size: 10px; font-weight: 500; color: #334155; }
+          .sub-cell { font-weight: 600; line-height: 1.2; }
+          .sub-class { font-size: 9px; font-weight: 500; color: #334155; }
           .empty-cell { color: #64748b; }
           .signatures {
             display: flex;
             justify-content: space-between;
-            margin-top: 40px;
-            padding: 16px 20px 0;
+            margin-top: 24px;
+            padding: 12px 20px 0;
             border-top: 2px solid #000;
           }
           .signature-box { text-align: center; min-width: 140px; }
-          .signature-title { font-size: 10px; margin-bottom: 40px; }
+          .signature-title { font-size: 10px; margin-bottom: 36px; }
           .signature-name {
             font-size: 11px;
             font-weight: 700;
@@ -796,7 +805,17 @@ export default function DailyOperationsTab({
             <div style="font-size: 14px; font-weight: 700; margin-bottom: 6px;">DERS GÖREVLENDİRME ÇİZELGESİ</div>
             <div style="font-size: 12px; font-weight: 600;">${formattedDate}</div>
           </div>
-          ${absentSections}
+          <table class="schedule-table">
+            <thead>
+              <tr>
+                <th class="row-label"></th>
+                ${lessonHeaders}
+              </tr>
+            </thead>
+            <tbody>
+              ${absentRows}
+            </tbody>
+          </table>
           <div class="signatures">
             ${printSignatureVpNames.map(name => `
               <div class="signature-box">
@@ -1074,6 +1093,15 @@ export default function DailyOperationsTab({
                 >
                   <Printer className="w-4 h-4" />
                   Yazdır
+                </button>
+              )}
+              {dailyAbsences.length > 0 && (
+                <button
+                  onClick={handleDownloadSubstitutions}
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-md text-sm font-medium flex items-center gap-2 transition-colors"
+                >
+                  <FileSpreadsheet className="w-4 h-4" />
+                  Excel
                 </button>
               )}
               {isAdmin && (

@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, renameSync, readdirSync, unlinkSync, writeFileSync } from 'fs';
-import { homedir, tmpdir } from 'os';
+import { mkdirSync, readFileSync, existsSync, renameSync, readdirSync, unlinkSync, writeFileSync, statSync } from 'fs';
+import { homedir, networkInterfaces, tmpdir } from 'os';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -13,12 +13,25 @@ import { config as loadDotenv } from 'dotenv';
 import { parseMebCalendarHtml, resolveMebCalendarUrls } from './src/lib/mebCalendarParse.ts';
 import { auditSnapshot, changedTopLevelKeys, collectionBase, sanitizeClientName } from './src/lib/auditLog.ts';
 import { sanitizeTeacherSwapCreate, teacherCancelSwap } from './src/lib/swapRequests.ts';
+import {
+  type LedgerEntry,
+  ledgerSignature,
+  mergeLicenseRecords,
+  normalizeLedgerEntry,
+  readLedgerFile,
+  writeLedgerFile,
+} from './src/lib/licenseLedger.ts';
+import { parseGithubRepo, syncGithubLedger, type GithubLedgerConfig } from './src/lib/licenseGithub.ts';
+import { lanIpv4Addresses } from './src/lib/lanAddresses.ts';
 
 // CJS (pkg/esbuild) ve ESM (tsx dev) ortamlarında güvenle çalışır
 const __dirname = process.cwd();
 
 // .env dosyasını hem cwd'den hem de exe'nin bulunduğu klasörden yüklemeyi dene.
 // Bu sayede pkg ile paketlendiğinde de exe'nin yanına bir .env konulabilir.
+// Ayrıca kullanıcı veri klasörü (%LOCALAPPDATA%\OkulNobetProgrami\.env) de okunur;
+// böylece sunucu sahibi kurulu uygulamada özel giriş anahtarını ayrı bir dosyada
+// tutabilir. Bu dosya paketlemeye dahil edilmez, okul kurulumlarına gitmez.
 (() => {
   const candidates: string[] = [];
   candidates.push(path.join(process.cwd(), '.env'));
@@ -26,6 +39,9 @@ const __dirname = process.cwd();
     const execDir = path.dirname((process as any).execPath || '');
     if (execDir) candidates.push(path.join(execDir, '.env'));
   } catch {}
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    candidates.push(path.join(process.env.LOCALAPPDATA, 'OkulNobetProgrami', '.env'));
+  }
   for (const p of candidates) {
     try {
       if (existsSync(p)) {
@@ -50,10 +66,6 @@ function envSecret(name: string): string | undefined {
   return value;
 }
 
-// Üretimde varsayılan sırlar kullanılıyorsa görünür şekilde uyar.
-if (!process.env.LICENSE_SECRET) {
-  console.warn('[license] LICENSE_SECRET çevresel değişkeni bulunamadı, varsayılan değer kullanılıyor. Üretimde mutlaka .env dosyasında ayarlayın.');
-}
 if (!envSecret('JWT_SECRET')) {
   console.warn('[auth] JWT_SECRET çevresel değişkeni bulunamadı, veritabanında saklanan rastgele anahtar kullanılacak.');
 }
@@ -74,28 +86,36 @@ try {
 }
 
 // ---- Lisans Sistemi ----
-// Bu değeri kendinize özel bir şeyle değiştirin ve kimseyle paylaşmayın.
-// generate-license.cjs dosyasındaki değerle aynı olmalıdır.
-const LICENSE_SECRET = process.env.LICENSE_SECRET || 'okul-nobet-2025-BURAYA-KENDI-GIZLI-ANAHTARINIZI-YAZIN';
+// Yeni kayıtlar yalnızca LICENSE_SECRET ile üretilmiş anahtarı kabul eder. Masaüstü paketinde
+// değer derleme sırasında .env'den gömülür (scripts/build-desktop.mjs); kaynak kodda yer almaz.
+// Güvenlik için kaynak koddaki eski yer tutucu metin artık hiçbir şekilde sır olarak kullanılmaz;
+// ne aktif sır olarak ne de geçmiş anahtarların doğrulanmasında.
+const PLACEHOLDER_LICENSE_SECRET = 'okul-nobet-2025-BURAYA-KENDI-GIZLI-ANAHTARINIZI-YAZIN';
+declare const __BUILD_LICENSE_SECRET__: string | undefined;
+const BUILD_LICENSE_SECRET = typeof __BUILD_LICENSE_SECRET__ === 'string' ? __BUILD_LICENSE_SECRET__ : '';
+// Yer tutucu metin gerçek sır sayılmaz; .env'de kalmışsa pakete gömülü sırra öncelik verilir.
+function configuredLicenseSecret(value: string | undefined): string {
+  const trimmed = String(value || '').trim();
+  if (!trimmed || trimmed === PLACEHOLDER_LICENSE_SECRET) return '';
+  return trimmed;
+}
+const LICENSE_SECRET =
+  configuredLicenseSecret(process.env.LICENSE_SECRET) ||
+  configuredLicenseSecret(BUILD_LICENSE_SECRET);
+if (!LICENSE_SECRET) {
+  console.warn('[license] LICENSE_SECRET ayarlı değil. Yeni okul kaydı ve şifre sıfırlama için .env dosyasına LICENSE_SECRET ekleyin.');
+}
 
-// Özel giriş anahtarı. Yalnızca sunucuda doğrulanır; .env ile değiştirilebilir.
-// .env'de yoksa kaynak koddaki varsayılan yalnızca bu bilgisayardan (127.0.0.1) yapılan girişte geçerlidir;
-// ağdaki diğer bilgisayarlardan ve bulut sunucusunda bu varsayılanla giriş yapılamaz.
+// Özel (süper yönetici) girişi: yazılım sahibinin, hangi bilgisayara kurulursa kurulsun
+// giriş yapabilmesi için gömülü bir varsayılan anahtar bulunur. Okul kurulumları bu
+// anahtarı bilmediğinden günlük kullanımda özel giriş kullanılmaz.
+// Gerekirse her kurulumda .env > SUPER_ADMIN_KEY ile değiştirilebilir.
 const SUPER_ADMIN_KEY_ENV = envSecret('SUPER_ADMIN_KEY');
 const DEFAULT_SUPER_ADMIN_KEY = '342665';
 const SUPER_ADMIN_KEY = SUPER_ADMIN_KEY_ENV || DEFAULT_SUPER_ADMIN_KEY;
-if (!SUPER_ADMIN_KEY_ENV) {
-  console.warn('[auth] SUPER_ADMIN_KEY ayarlı değil; özel giriş yalnızca bu bilgisayardan yapılabilir.');
-}
 
-function isLoopbackRequest(req: any): boolean {
-  const addr = String(req.socket?.remoteAddress || '');
-  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
-}
-
-function superAdminLoginAllowed(req: any): boolean {
-  if (SUPER_ADMIN_KEY_ENV) return true;
-  return !process.env.DATA_DIR && isLoopbackRequest(req);
+function superAdminLoginAllowed(_req: any): boolean {
+  return !!SUPER_ADMIN_KEY;
 }
 
 /** Token'ı şifreye/anahtara bağlayan kısa parmak izi: şifre değişince eski oturumlar geçersiz olur. */
@@ -103,16 +123,20 @@ function secretFingerprint(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex').slice(0, 16);
 }
 
-function generateLicenseKey(kurumKodu: string): string {
-  const hmac = crypto.createHmac('sha256', LICENSE_SECRET);
+function licenseKeyFor(secret: string, kurumKodu: string): string {
+  const hmac = crypto.createHmac('sha256', secret);
   hmac.update(kurumKodu);
   const hex = hmac.digest('hex').substring(0, 16).toUpperCase();
   return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}`;
 }
 
-function validateLicenseKey(kurumKodu: string, key: string): boolean {
+function generateLicenseKey(kurumKodu: string): string {
+  return licenseKeyFor(LICENSE_SECRET, kurumKodu);
+}
+
+function licenseKeyMatches(secret: string, kurumKodu: string, key: string): boolean {
   const cleanKey = key.trim().replace(/-/g, '').toUpperCase();
-  const expected = generateLicenseKey(kurumKodu).replace(/-/g, '');
+  const expected = licenseKeyFor(secret, kurumKodu).replace(/-/g, '');
   // Eşit uzunlukta zaman-sabit karşılaştırma
   if (cleanKey.length !== expected.length) return false;
   try {
@@ -120,6 +144,12 @@ function validateLicenseKey(kurumKodu: string, key: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Lisans anahtarı yalnızca güncel LICENSE_SECRET ile üretilmişse geçerlidir. */
+function validateLicenseKey(kurumKodu: string, key: string): boolean {
+  if (!LICENSE_SECRET) return false;
+  return licenseKeyMatches(LICENSE_SECRET, kurumKodu, key);
 }
 
 function parseSchoolCodeFromYol(yol?: string): string | null {
@@ -382,10 +412,11 @@ function ensureLegacyLicense(kurumKodu: string): ReturnType<typeof checkLicenseR
     if (name) okulAdi = name;
   } catch { /* varsayılan ad kalır */ }
   db.prepare(`
-    INSERT OR IGNORE INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive)
-    VALUES (?, ?, ?, ?, ?, NULL, 1)
-  `).run(uuidv4(), kurumKodu, okulAdi, generateLicenseKey(kurumKodu), new Date().toISOString());
+    INSERT OR IGNORE INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive, updatedAt)
+    VALUES (?, ?, ?, ?, ?, NULL, 1, ?)
+  `).run(uuidv4(), kurumKodu, okulAdi, generateLicenseKey(kurumKodu), new Date().toISOString(), new Date().toISOString());
   console.log(`[license] ${kurumKodu} için eski kurulumdan lisans kaydı oluşturuldu.`);
+  applyLicenseLedger();
   return checkLicenseRecord(kurumKodu);
 }
 
@@ -486,6 +517,7 @@ function importDatabaseFile(sourcePath: string, kurumKodu?: string): ImportCount
       documents: copyTable('documents'),
     }))();
     scopeLegacyCollections();
+    applyLicenseLedger();
     return counts;
   } finally {
     src.close();
@@ -555,6 +587,168 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_audit_log_kurum ON audit_log (kurumKodu, id);
 `);
+
+try {
+  db.exec('ALTER TABLE licenses ADD COLUMN updatedAt TEXT');
+} catch { /* sütun zaten var */ }
+
+const ledgerPointerPath = path.join(DB_DIR, 'lisans-defteri.path');
+
+function resolveLedgerPath(): string {
+  try {
+    if (existsSync(ledgerPointerPath)) {
+      const chosen = readFileSync(ledgerPointerPath, 'utf8').trim();
+      if (chosen) return path.resolve(chosen);
+    }
+  } catch { /* varsayılan dosya */ }
+  return path.join(DB_DIR, 'lisans-defteri.json');
+}
+
+function licenseRowToEntry(row: any): LedgerEntry | null {
+  return normalizeLedgerEntry({
+    id: row.id,
+    kurumKodu: row.kurumKodu,
+    okulAdi: row.okulAdi,
+    licenseKey: row.licenseKey,
+    createdAt: row.createdAt,
+    expiresAt: row.expiresAt || null,
+    isActive: row.isActive ? 1 : 0,
+    lastLoginAt: row.lastLoginAt || null,
+    updatedAt: row.updatedAt || row.createdAt,
+    deletedAt: null,
+  });
+}
+
+function applyLedgerEntriesToDb(entries: LedgerEntry[]): void {
+  const upsert = db.prepare(`
+    INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive, lastLoginAt, updatedAt)
+    VALUES (@id, @kurumKodu, @okulAdi, @licenseKey, @createdAt, @expiresAt, @isActive, @lastLoginAt, @updatedAt)
+    ON CONFLICT(kurumKodu) DO UPDATE SET
+      okulAdi = excluded.okulAdi,
+      licenseKey = excluded.licenseKey,
+      expiresAt = excluded.expiresAt,
+      isActive = excluded.isActive,
+      lastLoginAt = excluded.lastLoginAt,
+      updatedAt = excluded.updatedAt
+  `);
+  db.transaction(() => {
+    for (const entry of entries) {
+      if (entry.deletedAt) {
+        db.prepare('DELETE FROM licenses WHERE kurumKodu = ?').run(entry.kurumKodu);
+        setLicenseRevoked(entry.kurumKodu, true);
+        continue;
+      }
+      upsert.run({
+        id: entry.id,
+        kurumKodu: entry.kurumKodu,
+        okulAdi: entry.okulAdi,
+        licenseKey: entry.licenseKey,
+        createdAt: entry.createdAt,
+        expiresAt: entry.expiresAt,
+        isActive: entry.isActive,
+        lastLoginAt: entry.lastLoginAt,
+        updatedAt: entry.updatedAt,
+      });
+      setLicenseRevoked(entry.kurumKodu, false);
+    }
+  })();
+}
+
+/** Yerel veritabanı ile paylaşılan lisans defterini birleştirir. En son değişiklik kazanır. */
+function applyLicenseLedger(extra: LedgerEntry[] = []): void {
+  const filePath = resolveLedgerPath();
+  let fileEntries: LedgerEntry[] = [];
+  try {
+    fileEntries = readLedgerFile(filePath);
+  } catch (err) {
+    console.warn('[license] Lisans defteri okunamadı:', err instanceof Error ? err.message : err);
+  }
+  const localEntries = (db.prepare('SELECT * FROM licenses').all() as any[])
+    .map(licenseRowToEntry)
+    .filter((entry): entry is LedgerEntry => !!entry);
+  const merged = mergeLicenseRecords([localEntries, fileEntries, extra]);
+  applyLedgerEntriesToDb(merged);
+
+  let latest: LedgerEntry[] = [];
+  try {
+    latest = readLedgerFile(filePath);
+  } catch { /* yazmadan önce yeniden okunamadı */ }
+  const finalMerged = mergeLicenseRecords([merged, latest]);
+  if (ledgerSignature(finalMerged) !== ledgerSignature(merged)) {
+    applyLedgerEntriesToDb(finalMerged);
+  }
+  try {
+    if (ledgerSignature(finalMerged) !== ledgerSignature(latest)) {
+      writeLedgerFile(filePath, finalMerged);
+    }
+  } catch (err) {
+    console.warn('[license] Lisans defteri yazılamadı:', err instanceof Error ? err.message : err);
+  }
+  void scheduleGithubSync();
+}
+
+const githubConfigPath = path.join(DB_DIR, 'lisans-github.json');
+let githubChain: Promise<void> = Promise.resolve();
+let lastGithubSync: { ok: boolean; message: string; repo: string } | null = null;
+
+function readGithubConfig(): GithubLedgerConfig | null {
+  let repo = String(process.env.LICENSE_GITHUB_REPO || '').trim();
+  let token = String(process.env.LICENSE_GITHUB_TOKEN || '').trim();
+  let filePath = String(process.env.LICENSE_GITHUB_PATH || 'lisans-defteri.json').trim();
+  try {
+    if (existsSync(githubConfigPath)) {
+      const saved = JSON.parse(readFileSync(githubConfigPath, 'utf8'));
+      if (saved?.repo) repo = String(saved.repo).trim();
+      if (saved?.token) token = String(saved.token).trim();
+      if (saved?.path) filePath = String(saved.path).trim();
+    }
+  } catch { /* ortam değişkeni kalır */ }
+  if (!parseGithubRepo(repo) || !token) return null;
+  return { repo, token, path: filePath || 'lisans-defteri.json' };
+}
+
+function githubStatus() {
+  const config = readGithubConfig();
+  return {
+    configured: !!config,
+    repo: config?.repo || '',
+    path: config?.path || 'lisans-defteri.json',
+    sync: lastGithubSync,
+  };
+}
+
+async function syncLicensesWithGithub(): Promise<void> {
+  const config = readGithubConfig();
+  if (!config) return;
+  const local = (db.prepare('SELECT * FROM licenses').all() as any[])
+    .map(licenseRowToEntry)
+    .filter((entry): entry is LedgerEntry => !!entry);
+  try {
+    const result = await syncGithubLedger(config, local);
+    applyLedgerEntriesToDb(result.entries);
+    writeLedgerFile(resolveLedgerPath(), result.entries);
+    lastGithubSync = {
+      ok: true,
+      repo: config.repo,
+      message: result.uploaded ? 'GitHub güncellendi.' : 'GitHub ile aynı.',
+    };
+  } catch (err) {
+    lastGithubSync = {
+      ok: false,
+      repo: config.repo,
+      message: err instanceof Error ? err.message : 'GitHub eşitlemesi başarısız.',
+    };
+    console.warn('[license]', lastGithubSync.message);
+  }
+}
+
+function scheduleGithubSync(): Promise<void> {
+  const job = githubChain.then(() => syncLicensesWithGithub());
+  githubChain = job.catch(() => {});
+  return job;
+}
+
+applyLicenseLedger();
 
 // Migration: scope existing unscoped collections by academic year
 const academicYearMigration = db.prepare("SELECT value FROM meta WHERE key = 'academic_year_migration_v1'").get();
@@ -783,7 +977,25 @@ async function startServer() {
   // Bulut barındırıcıları istekleri bir vekil sunucu üzerinden iletir; deneme sınırı gerçek IP'ye uygulanmalı.
   if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 
-  app.use(cors());
+  // Tarayıcı tabanlı farklı sitelerin API yanıtlarını okuyup/yazabilmesi (çapraz köken,
+  // ör. lisans anahtarı denemesi) engellenir. Uygulamanın kendisi (masaüstü veya LAN
+  // istemcisi) her zaman aynı kökenden istek atar; bu yüzden yalnızca Origin ana bilgisayarı
+  // isteğin Host'u ile aynı olan isteklere izin verilir.
+  app.use(cors((req, callback) => {
+    const origin = req.headers.origin;
+    let allow = false;
+    if (!origin) {
+      // Aynı köken istekleri ve tarayıcı dışı istemciler (curl, LAN) Origin göndermeyebilir.
+      allow = true;
+    } else {
+      try {
+        allow = new URL(origin).host === req.headers.host;
+      } catch {
+        allow = false;
+      }
+    }
+    callback(null, { origin: allow, credentials: false });
+  }));
   // Arşivlenen nöbet çizelgeleri tek belgede tutulduğundan varsayılan 100kb sınırı yetmez.
   app.use(express.json({ limit: '50mb' }));
 
@@ -796,7 +1008,8 @@ async function startServer() {
 
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
-    jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+    // Algoritma açıkça HS256 ile sınırlandırılır (algoritma karışıklığı saldırılarına karşı).
+    jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }, (err: any, user: any) => {
       if (err) return res.status(403).json({ error: 'Forbidden' });
       if (!isSessionStillValid(user)) {
         return res.status(401).json({ error: 'Oturumunuz sona erdi. Lütfen yeniden giriş yapın.' });
@@ -810,7 +1023,7 @@ async function startServer() {
   function isSessionStillValid(user: any): boolean {
     if (!user || typeof user !== 'object') return false;
     if (user.role === 'superadmin') {
-      return user.kv === secretFingerprint(SUPER_ADMIN_KEY);
+      return !!SUPER_ADMIN_KEY && user.kv === secretFingerprint(SUPER_ADMIN_KEY);
     }
     const row: any = db.prepare('SELECT role, kurumKodu, passwordHash FROM users WHERE id = ?').get(user.id);
     if (!row || row.role !== user.role || row.kurumKodu !== user.kurumKodu) return false;
@@ -935,15 +1148,16 @@ async function startServer() {
         // Okulun lokal veritabanında lisans kaydı yoksa, doğrulanan anahtarla ilk kaydı oluştur.
         if (lic.reason === 'not-found') {
           db.prepare(`
-            INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive, updatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
           `).run(
             uuidv4(),
             cleanKurumKodu,
             `Kurum ${cleanKurumKodu}`,
             generateLicenseKey(cleanKurumKodu),
             new Date().toISOString(),
-            null
+            null,
+            new Date().toISOString(),
           );
         }
 
@@ -965,6 +1179,7 @@ async function startServer() {
           updatedAt: new Date().toISOString()
         }));
       })();
+      applyLicenseLedger();
 
       res.json({ success: true });
     } catch (err: any) {
@@ -1017,11 +1232,12 @@ async function startServer() {
       const token = jwt.sign(
         { id: user.id, kurumKodu: user.kurumKodu, role: user.role, pwv: secretFingerprint(user.passwordHash) },
         JWT_SECRET,
-        { expiresIn: '7d' },
+        { expiresIn: '7d', algorithm: 'HS256' },
       );
 
       // Lisans tablosunda lastLoginAt güncelle
       db.prepare('UPDATE licenses SET lastLoginAt = ? WHERE kurumKodu = ?').run(new Date().toISOString(), user.kurumKodu);
+      applyLicenseLedger();
 
       res.json({
         token,
@@ -1040,6 +1256,9 @@ async function startServer() {
 
   // Auth: Özel Giriş
   app.post('/api/auth/superadmin-login', (req, res) => {
+    if (!SUPER_ADMIN_KEY) {
+      return res.status(404).json({ error: 'Bu kurulumda özel yönetici girişi etkin değil.' });
+    }
     const { masterKey } = req.body;
     const rateKey = authRateKey(req, 'superadmin');
     if (isAuthRateLimited(rateKey)) {
@@ -1049,7 +1268,7 @@ async function startServer() {
     if (!superAdminLoginAllowed(req)) {
       recordAuthFailure(rateKey);
       return res.status(403).json({
-        error: 'Özel giriş bu sunucuda yalnızca sunucu bilgisayarından yapılabilir. Uzaktan giriş için sunucuda SUPER_ADMIN_KEY ayarlanmalıdır.',
+        error: 'Özel yönetici girişi bu sunucuda etkin değil.',
       });
     }
 
@@ -1063,7 +1282,7 @@ async function startServer() {
       kurumKodu: '__superadmin__',
       role: 'superadmin',
       kv: secretFingerprint(SUPER_ADMIN_KEY),
-    }, JWT_SECRET, { expiresIn: '7d' });
+    }, JWT_SECRET, { expiresIn: '7d', algorithm: 'HS256' });
 
     res.json({
       token,
@@ -1076,12 +1295,14 @@ async function startServer() {
   });
 
   // Licenses: Get all
-  app.get('/api/licenses', authenticateToken, (req: any, res) => {
+  app.get('/api/licenses', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'superadmin') {
       return res.status(403).json({ error: 'Yetkisiz erişim.' });
     }
 
     try {
+      applyLicenseLedger();
+      await githubChain;
       const licenses = db.prepare('SELECT * FROM licenses ORDER BY createdAt DESC').all();
       res.json(licenses);
     } catch (err) {
@@ -1090,8 +1311,87 @@ async function startServer() {
     }
   });
 
+  app.get('/api/licenses/github', authenticateToken, (req: any, res) => {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Yetkisiz erişim.' });
+    }
+    res.json(githubStatus());
+  });
+
+  app.put('/api/licenses/github', authenticateToken, async (req: any, res) => {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Yetkisiz erişim.' });
+    }
+    const repo = String(req.body?.repo || '').trim();
+    const token = String(req.body?.token || '').trim();
+    if (!parseGithubRepo(repo)) {
+      return res.status(400).json({ error: 'Depo adı "kullanici/depo" biçiminde olmalı.' });
+    }
+    const existing = readGithubConfig();
+    const nextToken = token || existing?.token || '';
+    if (!nextToken) {
+      return res.status(400).json({ error: 'GitHub kişisel erişim anahtarını yazın.' });
+    }
+    if (existing && existing.repo !== repo && !token) {
+      return res.status(400).json({ error: 'Depo değişti. Erişim anahtarını yeniden yazın.' });
+    }
+    try {
+      writeFileSync(githubConfigPath, JSON.stringify({
+        repo,
+        token: nextToken,
+        path: 'lisans-defteri.json',
+      }, null, 2), 'utf8');
+      applyLicenseLedger();
+      await githubChain;
+      const status = githubStatus();
+      if (status.sync && !status.sync.ok) {
+        return res.status(400).json({ error: status.sync.message, ...status });
+      }
+      res.json(status);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'GitHub ayarı kaydedilemedi.' });
+    }
+  });
+
+  app.get('/api/licenses/ledger', authenticateToken, (req: any, res) => {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Yetkisiz erişim.' });
+    }
+    const ledgerPath = resolveLedgerPath();
+    res.json({ path: ledgerPath, exists: existsSync(ledgerPath) });
+  });
+
+  app.put('/api/licenses/ledger', authenticateToken, (req: any, res) => {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Yetkisiz erişim.' });
+    }
+    const raw = String(req.body?.path || '').trim();
+    if (!raw) {
+      return res.status(400).json({ error: 'Lisans defteri dosyasının yolunu yazın.' });
+    }
+    let target = path.resolve(raw);
+    try {
+      if (existsSync(target) && statSync(target).isDirectory()) {
+        target = path.join(target, 'lisans-defteri.json');
+      }
+    } catch { /* dosya değilse aşağıdaki kontrol yeter */ }
+    if (!target.toLowerCase().endsWith('.json')) {
+      return res.status(400).json({ error: 'Dosya adı .json ile bitmeli. Klasör verdiyseniz klasörün yolunu yazın.' });
+    }
+    try {
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(ledgerPointerPath, target, 'utf8');
+      applyLicenseLedger();
+    } catch (err) {
+      return res.status(400).json({
+        error: err instanceof Error ? `Bu konuma yazılamadı: ${err.message}` : 'Bu konuma yazılamadı.',
+      });
+    }
+    res.json({ path: resolveLedgerPath(), exists: existsSync(resolveLedgerPath()) });
+  });
+
   // Licenses: Create new
-  app.post('/api/licenses', authenticateToken, (req: any, res) => {
+  app.post('/api/licenses', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'superadmin') {
       return res.status(403).json({ error: 'Yetkisiz erişim.' });
     }
@@ -1119,11 +1419,13 @@ async function startServer() {
       const id = uuidv4();
       db.transaction(() => {
         db.prepare(`
-          INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive)
-          VALUES (?, ?, ?, ?, ?, ?, 1)
-        `).run(id, cleanKurumKodu, okulAdi.trim(), licenseKey, new Date().toISOString(), expiresAt || null);
+          INSERT INTO licenses (id, kurumKodu, okulAdi, licenseKey, createdAt, expiresAt, isActive, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        `).run(id, cleanKurumKodu, okulAdi.trim(), licenseKey, new Date().toISOString(), expiresAt || null, new Date().toISOString());
         setLicenseRevoked(cleanKurumKodu, false);
       })();
+      applyLicenseLedger();
+      await githubChain;
 
       res.json({ 
         id, 
@@ -1141,18 +1443,35 @@ async function startServer() {
   });
 
   // Licenses: Delete
-  app.delete('/api/licenses/:id', authenticateToken, (req: any, res) => {
+  app.delete('/api/licenses/:id', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'superadmin') {
       return res.status(403).json({ error: 'Yetkisiz erişim.' });
     }
 
     try {
-      const license: any = db.prepare('SELECT kurumKodu FROM licenses WHERE id = ?').get(req.params.id);
+      const license: any = db.prepare('SELECT * FROM licenses WHERE id = ?').get(req.params.id);
       db.transaction(() => {
         db.prepare('DELETE FROM licenses WHERE id = ?').run(req.params.id);
         // Silinen lisansın okulu, kaydı olmayan eski kurulum sayılıp girişe devam edemesin.
         if (license?.kurumKodu) setLicenseRevoked(license.kurumKodu, true);
       })();
+      if (license?.kurumKodu) {
+        const now = new Date().toISOString();
+        const tombstone = normalizeLedgerEntry({
+          id: String(license.id || license.kurumKodu),
+          kurumKodu: license.kurumKodu,
+          okulAdi: license.okulAdi,
+          licenseKey: license.licenseKey,
+          createdAt: license.createdAt,
+          expiresAt: license.expiresAt || null,
+          isActive: 0,
+          lastLoginAt: license.lastLoginAt || null,
+          updatedAt: now,
+          deletedAt: now,
+        });
+        if (tombstone) applyLicenseLedger([tombstone]);
+      }
+      await githubChain;
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -1161,7 +1480,7 @@ async function startServer() {
   });
 
   // Licenses: Bitiş tarihi uzatma / okul adı düzeltme (süper yönetici)
-  app.patch('/api/licenses/:id', authenticateToken, (req: any, res) => {
+  app.patch('/api/licenses/:id', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'superadmin') {
       return res.status(403).json({ error: 'Yetkisiz erişim.' });
     }
@@ -1189,11 +1508,14 @@ async function startServer() {
       }
 
       // Uzatma / düzenleme sonrası okul aynı hesapla girebilsin diye lisansı yeniden aktif et.
-      db.prepare('UPDATE licenses SET expiresAt = ?, okulAdi = ?, isActive = 1 WHERE id = ?').run(
+      db.prepare('UPDATE licenses SET expiresAt = ?, okulAdi = ?, isActive = 1, updatedAt = ? WHERE id = ?').run(
         nextExpires,
         nextOkul,
+        new Date().toISOString(),
         req.params.id,
       );
+      applyLicenseLedger();
+      await githubChain;
       const updated: any = db.prepare('SELECT * FROM licenses WHERE id = ?').get(req.params.id);
       res.json(updated);
     } catch (err) {
@@ -1203,7 +1525,7 @@ async function startServer() {
   });
 
   // Licenses: Toggle active
-  app.patch('/api/licenses/:id/toggle', authenticateToken, (req: any, res) => {
+  app.patch('/api/licenses/:id/toggle', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'superadmin') {
       return res.status(403).json({ error: 'Yetkisiz erişim.' });
     }
@@ -1215,8 +1537,11 @@ async function startServer() {
       }
 
       const newStatus = license.isActive ? 0 : 1;
-      db.prepare('UPDATE licenses SET isActive = ? WHERE id = ?').run(newStatus, req.params.id);
-      res.json({ ...license, isActive: newStatus });
+      const updatedAt = new Date().toISOString();
+      db.prepare('UPDATE licenses SET isActive = ?, updatedAt = ? WHERE id = ?').run(newStatus, updatedAt, req.params.id);
+      applyLicenseLedger();
+      await githubChain;
+      res.json({ ...license, isActive: newStatus, updatedAt });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Lisans güncellenirken hata oluştu.' });
@@ -1330,7 +1655,7 @@ async function startServer() {
         ? jwt.sign(
             { id: user.id, kurumKodu: user.kurumKodu, role: user.role, pwv: secretFingerprint(newHash) },
             JWT_SECRET,
-            { expiresIn: '7d' },
+            { expiresIn: '7d', algorithm: 'HS256' },
           )
         : undefined;
       res.json({ success: true, ...(token ? { token } : {}) });
@@ -1351,6 +1676,11 @@ async function startServer() {
       },
       license: isSuper ? null : getLicenseSummary(req.user.kurumKodu),
     });
+  });
+
+  // Oturum açmış kullanıcı: başka bilgisayarların bağlanacağı yerel adres.
+  app.get('/api/network', authenticateToken, (_req, res) => {
+    res.json({ addresses: lanIpv4Addresses(networkInterfaces()), port: PORT });
   });
 
   // Public: Sürüm bilgisi (server-client uyum kontrolü için)
@@ -1826,7 +2156,7 @@ async function startServer() {
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
-  server.on('error', (err: NodeJS.ErrnoException) => {
+server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
       console.error(`[server] ${PORT} portu kullanımda. Uygulamanın başka bir kopyası açık olabilir.`);
     } else {

@@ -1,8 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getDay, parseISO } from 'date-fns';
-import { Assignment, Teacher, Location, Holiday, canTeacherDutyOnDay } from '../types';
+import { Assignment, Teacher, Location, Holiday } from '../types';
 import {
-  canTakeSlotToday,
   createFairDistributionState,
   FairDistributionState,
   getMonthKey,
@@ -15,6 +14,8 @@ import {
 import { seedFairStateFromHistory } from './dutyHistory';
 import { buildTeacherHomeLocations, rotationAnchorWeek, teacherMatchesLocationOnDate } from './dutyLocation';
 import { getWeeklyDutyCount, remainingActiveDaysInWeek, slotsForDay, weekKey } from './weeklyQuota';
+import { countTeacherDutiesInWeek, preferredDayStillAhead, teachersForDutySlot } from './dutySlotRules';
+import { canPlaceWeekDuty, extraDutyPlaceIds, orderSlotIds } from './extraDutyPlace';
 
 function buildSlotsForDate(
   locations: Location[],
@@ -130,7 +131,11 @@ export function generateDutyAssignmentsForDate(
   const date = parseISO(dateStr);
   const dayOfWeek = getDay(date);
   const holidayDates = new Set(holidays.map(h => h.date));
-  const slotsToFill = buildSlotsForDate(locations, date, existingAssignments, schoolDays, holidayDates);
+  const extraPlaces = extraDutyPlaceIds(locations);
+  const slotsToFill = orderSlotIds(
+    buildSlotsForDate(locations, date, existingAssignments, schoolDays, holidayDates),
+    extraPlaces,
+  );
   if (!slotsToFill.length) return [];
 
   const fairState = seedFairStateFromAssignments(teachers, existingAssignments, dateStr);
@@ -138,9 +143,9 @@ export function generateDutyAssignmentsForDate(
 
   const monthKey = getMonthKey(dateStr);
   const assignedToday = new Set<string>();
-  const availableForDay = eligibleTeachers.filter(t => canTeacherDutyOnDay(t, dayOfWeek));
-  if (availableForDay.length === 0) return [];
-
+  const weekDutyCount = countTeacherDutiesInWeek(existingAssignments, weekKey(date));
+  const weeklySlots = locations.reduce((sum, loc) => sum + getWeeklyDutyCount(loc), 0);
+  const allowExtraDuty = eligibleTeachers.length > 0 && eligibleTeachers.length < weeklySlots;
   const homeMap = buildTeacherHomeLocations(locations);
   const homeCount = (id: string) => homeMap[id]?.length ?? 0;
   const matchesSlot = (t: Teacher, locationId: string) =>
@@ -148,36 +153,43 @@ export function generateDutyAssignmentsForDate(
   const result: Assignment[] = [];
 
   for (let s = 0; s < slotsToFill.length; s++) {
-    const slotCandidates = availableForDay.filter(t =>
-      canTakeSlotToday(t.id, slotsToFill[s], assignedToday, homeCount(t.id))
-      && matchesSlot(t, slotsToFill[s]),
-    );
-    // Bu yere atanan öğretmenler önceliklidir.
+    const dayPool = teachersForDutySlot(eligibleTeachers, dayOfWeek, assignedToday, {
+      weekDutyCount,
+      allowExtraDuty,
+      fixedDayStillAhead: (t) => preferredDayStillAhead(t, date, schoolDays, holidayDates),
+    });
+    if (dayPool.length === 0) break;
+    const availableForDay = dayPool.filter(t => canPlaceWeekDuty(weekDutyCount[t.id] ?? 0, slotsToFill[s], extraPlaces));
+    if (availableForDay.length === 0) continue;
+    const slotCandidates = availableForDay.filter(t => matchesSlot(t, slotsToFill[s]));
     const preferredCandidates = preferSlotPool(slotCandidates, assignedToday, id => homeCount(id) > 0);
-    const pool = preferredCandidates.length > 0
-      ? preferredCandidates
-      : availableForDay.filter(t => !assignedToday.has(t.id));
+    const pool = preferredCandidates.length > 0 ? preferredCandidates : slotCandidates.length > 0 ? slotCandidates : availableForDay;
 
     const chosen = pickTeacherForSlot(pool, fairState, assignedToday, slotsToFill[s], monthKey, dayOfWeek, dateStr);
     if (!chosen) continue;
 
-    const isDoubleDuty = assignedToday.has(chosen.id);
-    if (!isDoubleDuty) {
-      const bestSlotIdx = pickBestSlotIndex(slotsToFill, s, fairState, chosen.id, locId => matchesSlot(chosen, locId));
-      if (bestSlotIdx !== s) {
-        [slotsToFill[s], slotsToFill[bestSlotIdx]] = [slotsToFill[bestSlotIdx], slotsToFill[s]];
-      }
+    const bestSlotIdx = pickBestSlotIndex(
+      slotsToFill,
+      s,
+      fairState,
+      chosen.id,
+      locId => matchesSlot(chosen, locId) && canPlaceWeekDuty(weekDutyCount[chosen.id] ?? 0, locId, extraPlaces),
+    );
+    if (bestSlotIdx !== s) {
+      [slotsToFill[s], slotsToFill[bestSlotIdx]] = [slotsToFill[bestSlotIdx], slotsToFill[s]];
     }
 
     const locationId = slotsToFill[s];
+    const extraDuty = (weekDutyCount[chosen.id] ?? 0) > 0;
     result.push({
       id: uuidv4(),
       date: dateStr,
       locationId,
       teacherId: chosen.id,
-      ...(isDoubleDuty ? { isDoubleDuty: true } : {}),
+      ...(extraDuty ? { isDoubleDuty: true } : {}),
     });
 
+    weekDutyCount[chosen.id] = (weekDutyCount[chosen.id] ?? 0) + 1;
     recordDutyAssignment(fairState, chosen.id, locationId, monthKey, s, false, dateStr);
     markAssignedToday(assignedToday, chosen.id, locationId);
   }
